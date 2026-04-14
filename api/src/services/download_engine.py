@@ -7,6 +7,11 @@ import json
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
+
+def _has_ffmpeg() -> bool:
+    """Return True if ffmpeg is available on PATH."""
+    return shutil.which("ffmpeg") is not None
+
 # Cookie handling: inside Docker use a mounted cookies file,
 # on the host use Chrome cookies directly.
 _COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "/app/cookies.txt")
@@ -57,10 +62,19 @@ def download_video(url, destination_folder, filename=None):
         print(f"Skipping (already exists): {title}")
         return str(save_path)
     print(f"Downloading: {title}...", end=" ", flush=True)
+    if _has_ffmpeg():
+        # Best quality: separate video+audio streams merged by ffmpeg
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        extra = {"merge_output_format": "mp4"}
+    else:
+        # ffmpeg not available: use a pre-muxed single-file mp4 stream
+        fmt = "best[ext=mp4]/best"
+        extra = {}
+
     ydl_opts = _yt_dlp_opts(
-        format="bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        merge_output_format="mp4",
+        format=fmt,
         outtmpl=str(pathlib.Path(destination_folder) / (safe_title + ".%(ext)s")),
+        **extra,
     )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
