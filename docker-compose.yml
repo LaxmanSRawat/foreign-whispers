@@ -1,5 +1,5 @@
 services:
-  # ── STT (Speech-to-Text) — GPU only ────────────────────────────────
+  # ── STT (Speech-to-Text) — GPU ──────────────────────────────────────
   whisper-gpu:
     container_name: foreign-whispers-stt
     profiles: [nvidia]
@@ -25,7 +25,28 @@ services:
       retries: 3
       start_period: 30s
 
-  # ── TTS (Text-to-Speech) — Chatterbox on GPU ──────────────────────
+  # ── STT (Speech-to-Text) — CPU fallback ─────────────────────────────
+  whisper-cpu:
+    container_name: foreign-whispers-stt
+    profiles: [cpu]
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - whisper-cache:/home/ubuntu/.cache/huggingface/hub
+    environment:
+      # Use a smaller model by default on CPU for acceptable speed.
+      # Override with FW_WHISPER_MODEL if you need higher accuracy.
+      - WHISPER__MODEL=Systran/faster-whisper-small
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://0.0.0.0:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── TTS (Text-to-Speech) — Chatterbox on GPU ───────────────────────
   chatterbox-gpu:
     container_name: foreign-whispers-tts
     profiles: [nvidia]
@@ -49,8 +70,26 @@ services:
               count: all
               capabilities: [gpu]
 
-  # ── API (CPU orchestrator) — all profiles ─────────────────────────
-  # The API container is CPU-only. It delegates GPU work to the STT
+  # ── TTS (Text-to-Speech) — Chatterbox on CPU ────────────────────────
+  chatterbox-cpu:
+    container_name: foreign-whispers-tts
+    profiles: [cpu]
+    image: travisvn/chatterbox-tts-api:latest
+    restart: unless-stopped
+    # Reduce shared-memory footprint; CPU inference needs far less.
+    shm_size: "2gb"
+    ports:
+      - "8020:8020"
+    environment:
+      - DEVICE=cpu
+      - DEFAULT_MODEL=multilingual
+      - PORT=8020
+    volumes:
+      - chatterbox-models:/app/models
+      - ./pipeline_data/speakers:/app/voices
+
+  # ── API (CPU orchestrator) — all profiles ──────────────────────────
+  # The API container is CPU-only. It delegates inference to the STT
   # and TTS containers above via HTTP.
   api:
     container_name: foreign-whispers-api
@@ -66,8 +105,13 @@ services:
       - "8080:8080"
     command: ["uv", "run", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
-      - CHATTERBOX_API_URL=http://localhost:8020
-      - FW_WHISPER_MODEL=base
+      # Use Docker Compose service names (not localhost) so containers
+      # can reach each other inside the Compose network.
+      - FW_CHATTERBOX_API_URL=http://foreign-whispers-tts:8020
+      - FW_WHISPER_API_URL=http://foreign-whispers-stt:8000
+      # remote = delegate to the speaches/chatterbox containers
+      - FW_WHISPER_BACKEND=remote
+      - FW_TTS_BACKEND=remote
     volumes:
       - ./pipeline_data:/app/pipeline_data
       - ./foreign_whispers:/app/foreign_whispers
