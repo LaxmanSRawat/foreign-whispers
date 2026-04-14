@@ -29,6 +29,7 @@ services:
   whisper-cpu:
     container_name: foreign-whispers-stt
     profiles: [cpu]
+    platform: linux/amd64   # image has no arm64 build; Rosetta 2 emulates it on Apple Silicon
     image: ghcr.io/speaches-ai/speaches:latest-cpu
     restart: unless-stopped
     ports:
@@ -74,6 +75,7 @@ services:
   chatterbox-cpu:
     container_name: foreign-whispers-tts
     profiles: [cpu]
+    platform: linux/amd64   # image has no arm64 build; Rosetta 2 emulates it on Apple Silicon
     image: travisvn/chatterbox-tts-api:latest
     restart: unless-stopped
     # Reduce shared-memory footprint; CPU inference needs far less.
