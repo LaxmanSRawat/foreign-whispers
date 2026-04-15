@@ -134,6 +134,10 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Baked into the standalone Next.js build because next.config.ts
+        # rewrites() are evaluated at build time, not at runtime.
+        API_URL: http://api:8080
     restart: unless-stopped
     ports:
       - "8501:8501"
