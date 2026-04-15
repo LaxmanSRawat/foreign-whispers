@@ -15,10 +15,13 @@ import {
   LanguagesIcon,
   Volume2Icon,
   ScissorsIcon,
+  UsersIcon
 } from "lucide-react";
 import { useElapsed } from "@/hooks/use-elapsed";
 import type { PipelineStage, PipelineState, StageState, StudioSettings } from "@/lib/types";
 import { computeConfigEntries } from "@/lib/config-id";
+
+
 
 const STAGES: {
   key: PipelineStage;
@@ -28,6 +31,8 @@ const STAGES: {
 }[] = [
   { key: "download", label: "Download", icon: DownloadIcon, description: "Fetch video + captions from YouTube" },
   { key: "transcribe", label: "Transcribe", icon: MicIcon, description: "Speech-to-text via Whisper" },
+  // Add after "transcribe" entry:
+  { key: "diarize", label: "Diarize", icon: UsersIcon, description: "Speaker diarization via pyannote" },
   { key: "translate", label: "Translate", icon: LanguagesIcon, description: "English to Spanish translation" },
   { key: "tts", label: "TTS", icon: Volume2Icon, description: "Text-to-speech synthesis" },
   { key: "stitch", label: "Stitch", icon: ScissorsIcon, description: "Combine audio + video + subtitles" },
