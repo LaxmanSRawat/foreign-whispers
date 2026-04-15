@@ -114,6 +114,14 @@ services:
       # remote = delegate to the speaches/chatterbox containers
       - FW_WHISPER_BACKEND=remote
       - FW_TTS_BACKEND=remote
+      # HF token — accept either FW_HF_TOKEN or FW_HF_TOKEN from .env,
+      # re-export inside the container as FW_HF_TOKEN (what Settings looks for)
+      - FW_HF_TOKEN=${FW_HF_TOKEN:-}
+      - FW_LOGFIRE_WRITE_TOKEN=${FW_LOGFIRE_WRITE_TOKEN:-}
+      # OpenRouter — no FW_ prefix; consumed directly by foreign_whispers.reranking
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
+      - OPENROUTER_LEARN=${OPENROUTER_LEARN:-1}
     volumes:
       - ./pipeline_data:/app/pipeline_data
       - ./foreign_whispers:/app/foreign_whispers

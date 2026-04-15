@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     @property
     def translations_dir(self) -> Path:
         return self.data_dir / "translations" / self.translation_model_dir
+    
+    @property
+    def diarizations_dir(self) -> Path:
+        return self.data_dir / "diarizations"
 
     @property
     def tts_audio_dir(self) -> Path:
@@ -87,6 +91,7 @@ class Settings(BaseSettings):
     whisper_api_url: str = "http://localhost:8000"
 
     # HuggingFace token for pyannote speaker diarization model
+    #load from FW_HF_TOKEN env var or .env file — required
     hf_token: str = ""
 
     # Logfire write token — set via FW_LOGFIRE_WRITE_TOKEN (or put in .env)

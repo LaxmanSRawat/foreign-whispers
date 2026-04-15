@@ -25,7 +25,8 @@ dependencies = [
     "requests",
     "setuptools<81",
     "pyyaml>=6.0.3",
-    "logfire",
+    "logfire[fastapi]",
+    "pyannote.audio",
 ]
 
 [dependency-groups]
@@ -35,7 +36,7 @@ dev = [
     "nbconvert>=7.17.0",
 ]
 alignment = [
-    "logfire",
+    "logfire[fastapi]",
     "silero-vad",
     "pyannote.audio",
 ]
