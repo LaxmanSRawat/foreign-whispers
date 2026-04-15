@@ -86,6 +86,7 @@ def create_app() -> FastAPI:
     from api.src.routers.translate import router as translate_router
     from api.src.routers.tts import router as tts_router
     from api.src.routers.stitch import router as stitch_router
+    #added diarization router
     from api.src.routers.diarize import router as diarize_router
 
     app.include_router(download_router)
