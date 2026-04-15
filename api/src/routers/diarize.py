@@ -63,6 +63,8 @@ async def diarize_endpoint(video_id: str):
     #
     from foreign_whispers.diarization import assign_speakers
 
+    #update transcript with speaker labels if it exists
+
     transcript_path = settings.transcriptions_dir / f"{title}.json"
     if transcript_path.exists():
         transcript = json.loads(transcript_path.read_text())
