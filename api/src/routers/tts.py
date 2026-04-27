@@ -27,11 +27,14 @@ async def tts_endpoint(
     request: Request,
     config: str = Query(..., pattern=r"^c-[0-9a-f]{7}$"),
     alignment: bool = Query(False),
+    target_language: str = Query("es", pattern=r"^[a-z]{2}(-[A-Z]{2})?$"),
 ):
     """Generate TTS audio for a translated transcript.
 
     *config* is an opaque directory name for caching.
     *alignment* enables temporal alignment (clamped stretch).
+    *target_language* picks the speaker-voice directory under
+    ``pipeline_data/speakers/{target_language}/``.
     """
     trans_dir = settings.translations_dir
     audio_dir = settings.tts_audio_dir / config
@@ -58,7 +61,12 @@ async def tts_endpoint(
     source_path = str(trans_dir / f"{title}.json")
 
     await _run_in_threadpool(
-        None, svc.text_file_to_speech, source_path, str(audio_dir), alignment=alignment
+        None,
+        svc.text_file_to_speech,
+        source_path,
+        str(audio_dir),
+        alignment=alignment,
+        target_language=target_language,
     )
 
     return {

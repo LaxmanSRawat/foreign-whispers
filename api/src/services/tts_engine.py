@@ -12,6 +12,8 @@ import soundfile as sf
 import pyrubberband
 from pydub import AudioSegment
 
+from foreign_whispers.voice_resolution import resolve_speaker_wav
+
 # ── Chatterbox API configuration ─────────────────────────────────────
 CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", "http://localhost:8020")
 # Path to the default speaker reference WAV, relative to pipeline_data/speakers/
@@ -196,12 +198,43 @@ def files_from_dir(dir_path) -> list:
     return es_files
 
 
-def _synthesize_raw(tts_engine, text: str, wav_path: str) -> bytes | None:
-    """GPU-bound: call TTS engine and return raw WAV bytes, or None on failure."""
+_SPEAKERS_DIR = pathlib.Path(__file__).resolve().parent.parent.parent.parent / "pipeline_data" / "speakers"
+
+
+def _build_speaker_voice_map(
+    segments: list[dict], target_language: str
+) -> dict[str | None, str]:
+    """Resolve a Chatterbox-relative WAV path for every distinct speaker.
+
+    Returns ``{speaker_label: relative_wav_path}``. Segments without a
+    ``speaker`` field map under ``None`` to the language default.
+    """
+    distinct = {seg.get("speaker") for seg in segments}
+    return {
+        spk: resolve_speaker_wav(_SPEAKERS_DIR, target_language, spk)
+        for spk in distinct
+    }
+
+
+def _synthesize_raw(
+    tts_engine,
+    text: str,
+    wav_path: str,
+    speaker_wav: str | None = None,
+) -> bytes | None:
+    """GPU-bound: call TTS engine and return raw WAV bytes, or None on failure.
+
+    *speaker_wav* (when provided) is forwarded to engines that support voice
+    cloning (currently :class:`ChatterboxClient`). Engines without cloning
+    support — e.g. local Coqui — receive the call without the kwarg.
+    """
     if not text or not text.strip():
         return None
     try:
-        tts_engine.tts_to_file(text=text, file_path=wav_path)
+        if speaker_wav and isinstance(tts_engine, ChatterboxClient):
+            tts_engine.tts_to_file(text=text, file_path=wav_path, speaker_wav=speaker_wav)
+        else:
+            tts_engine.tts_to_file(text=text, file_path=wav_path)
         return pathlib.Path(wav_path).read_bytes()
     except Exception as exc:
         print(f"[tts] TTS failed for segment ({exc}), using silence")
@@ -395,7 +428,14 @@ def _compute_speech_offset(source_path: str) -> float:
     return yt_start - whisper_start
 
 
-def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=None):
+def text_file_to_speech(
+    source_path,
+    output_path,
+    tts_engine=None,
+    *,
+    alignment=None,
+    target_language: str = "es",
+):
     """Read translated JSON with segment timestamps and produce a time-aligned WAV.
 
     Each segment is individually synthesized and time-stretched to match its
@@ -408,6 +448,13 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
 
     *alignment* overrides the module-level ``_ALIGNMENT_ENABLED`` flag.
     Pass True for aligned mode, False for baseline, or None to use the env var.
+
+    *target_language* is the BCP-47 / ISO-639-1 code (e.g. ``"es"``) used to
+    select per-speaker reference voices from
+    ``pipeline_data/speakers/{target_language}/``. Each segment's ``speaker``
+    field (added by the diarize stage) picks a voice via
+    :func:`foreign_whispers.voice_resolution.resolve_speaker_wav`; segments
+    without a ``speaker`` fall back to the language default.
     """
     engine = tts_engine if tts_engine is not None else _get_tts_engine()
     use_alignment = alignment if alignment is not None else _ALIGNMENT_ENABLED
@@ -466,6 +513,14 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
             "aligned_seg": aligned_seg,
         })
 
+    # ── Resolve per-speaker reference voices ──────────────────────────
+    # One lookup per distinct speaker (not per segment) — diarize typically
+    # emits a handful of speakers across hundreds of segments.
+    voice_map = _build_speaker_voice_map(segments, target_language)
+    distinct_voices = sorted(set(voice_map.values()))
+    if len(distinct_voices) > 1 or any(v for v in distinct_voices):
+        print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
+
     # ── Phase 1: GPU synthesis (concurrent) ───────────────────────────
     # Submit all TTS calls to a thread pool so the GPU stays busy while
     # previous results are being downloaded / decoded.
@@ -475,13 +530,18 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
     raw_wav_map: dict[int, bytes | None] = {}
 
     with tempfile.TemporaryDirectory() as synth_dir:
-        def _do_synth(idx: int, text: str) -> tuple[int, bytes | None]:
+        def _do_synth(idx: int, text: str, speaker_wav: str | None) -> tuple[int, bytes | None]:
             wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
-            return idx, _synthesize_raw(engine, text, wav_path)
+            return idx, _synthesize_raw(engine, text, wav_path, speaker_wav=speaker_wav)
 
         with ThreadPoolExecutor(max_workers=_TTS_WORKERS) as pool:
             futures = {
-                pool.submit(_do_synth, m["index"], m["text"]): m["index"]
+                pool.submit(
+                    _do_synth,
+                    m["index"],
+                    m["text"],
+                    voice_map.get(segments[m["index"]].get("speaker")),
+                ): m["index"]
                 for m in seg_metas
             }
             for fut in as_completed(futures):
