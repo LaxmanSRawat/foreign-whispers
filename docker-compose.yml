@@ -63,6 +63,12 @@ services:
     volumes:
       - chatterbox-models:/app/models
       - ./pipeline_data/speakers:/app/voices
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8020/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
     deploy:
       resources:
         reservations:
@@ -89,6 +95,12 @@ services:
     volumes:
       - chatterbox-models:/app/models
       - ./pipeline_data/speakers:/app/voices
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8020/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
 
   # ── API (CPU orchestrator) — all profiles ──────────────────────────
   # The API container is CPU-only. It delegates inference to the STT
@@ -146,7 +158,10 @@ services:
       - HOSTNAME=0.0.0.0
       - PORT=8501
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8501"]
+      # Use 127.0.0.1 — the container's /etc/hosts maps `localhost` to ::1
+      # only, while next-server binds IPv4. wget against `localhost` returns
+      # "connection refused" even though the server is healthy.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8501"]
       interval: 15s
       timeout: 5s
       retries: 3
