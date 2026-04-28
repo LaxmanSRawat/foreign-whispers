@@ -194,8 +194,6 @@ export function usePipeline() {
     try {
       const dl = await run("download", () => downloadVideo(video.url));
       await run("transcribe", () => transcribeVideo(dl.video_id, settings.useYoutubeCaptions));
-      // After: await run("transcribe", () => transcribeVideo(dl.video_id, settings.useYoutubeCaptions));
-      // Before: await run("translate", () => translateVideo(dl.video_id, "es"));
       if (settings.diarization.length > 0) {
         await run("diarize", () => diarizeVideo(dl.video_id));
       }
