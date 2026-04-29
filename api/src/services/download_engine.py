@@ -77,10 +77,53 @@ def download_video(url, destination_folder, filename=None):
         outtmpl=str(pathlib.Path(destination_folder) / (safe_title + ".%(ext)s")),
         **extra,
     )
+
+    # Dev affordance: when FW_DOWNLOAD_DURATION_SECONDS is a positive integer,
+    # truncate the download to the first N seconds. Lets the slow CPU TTS
+    # stage finish in minutes instead of hours during pipeline iteration.
+    # Leave unset (or 0) for normal full-length downloads.
+    duration_s = int(os.getenv("FW_DOWNLOAD_DURATION_SECONDS", "0") or 0)
+    if duration_s > 0:
+        ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
+            None, [(0, duration_s)]
+        )
+        ydl_opts["force_keyframes_at_cuts"] = True
+        print(f"[FW_DOWNLOAD_DURATION_SECONDS={duration_s}s — truncating clip]", end=" ", flush=True)
+        _purge_stale_artifacts(pathlib.Path(destination_folder).parent, safe_title)
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     print("Success!")
     return str(save_path)
+
+
+def _purge_stale_artifacts(api_dir: pathlib.Path, safe_title: str) -> None:
+    """Delete cached downstream artifacts for *safe_title* under api_dir.
+
+    Called when FW_DOWNLOAD_DURATION_SECONDS forces a fresh truncated download —
+    transcribe/translate/TTS/stitch all cache by filename, so stale full-length
+    artifacts would otherwise short-circuit the re-run.
+    """
+    leaf_globs = [
+        api_dir / "youtube_captions" / f"{safe_title}.*",
+        api_dir / "transcriptions" / "whisper" / f"{safe_title}.*",
+        api_dir / "translations" / "argos" / f"{safe_title}.*",
+        api_dir / "dubbed_videos" / f"{safe_title}.*",
+        api_dir / "dubbed_captions" / f"{safe_title}.*",
+    ]
+    for pattern in leaf_globs:
+        for stale in pattern.parent.glob(pattern.name):
+            stale.unlink(missing_ok=True)
+            print(f"[dev] purged stale: {stale.relative_to(api_dir)}")
+    # TTS audio is namespaced by config id (c-XXXXXXX/{safe_title}.*)
+    tts_root = api_dir / "tts_audio" / "chatterbox"
+    if tts_root.is_dir():
+        for cfg_dir in tts_root.iterdir():
+            if not cfg_dir.is_dir():
+                continue
+            for stale in cfg_dir.glob(f"{safe_title}.*"):
+                stale.unlink(missing_ok=True)
+                print(f"[dev] purged stale: {stale.relative_to(api_dir)}")
 
 def download_caption(url, destination_folder, filename=None):
     """download english captions to <filename.txt> in destination_folder, skipping if file already exists.
@@ -89,12 +132,22 @@ def download_caption(url, destination_folder, filename=None):
     video_id, title = get_video_info(url)
     safe_title = filename or re.sub(r'[:|]', '', title).strip()
     save_path = pathlib.Path(destination_folder) / (safe_title + ".txt")
-    if save_path.exists():
+
+    # When truncating downloads, the cached full-length captions are stale —
+    # purge them in download_video, and here we always re-fetch + clip.
+    duration_s = int(os.getenv("FW_DOWNLOAD_DURATION_SECONDS", "0") or 0)
+
+    if save_path.exists() and duration_s == 0:
         print(f"Skipping captions (already exists): {title}")
         return str(save_path)
+
     print(f"Downloading captions for {title}... ", end=" ", flush=True)
     api = YouTubeTranscriptApi()
     caption = api.fetch(video_id).to_raw_data()
+    if duration_s > 0:
+        before = len(caption)
+        caption = [s for s in caption if s.get("start", 0) < duration_s]
+        print(f"[truncated {before}→{len(caption)} segments to first {duration_s}s]", end=" ", flush=True)
     with open(save_path, 'w') as outfile:
         for segment in caption:
             outfile.write(json.dumps(segment) + "\n")
