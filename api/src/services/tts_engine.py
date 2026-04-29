@@ -7,6 +7,7 @@ import glob
 import tempfile
 
 import requests
+import time
 import librosa
 import soundfile as sf
 import pyrubberband
@@ -15,9 +16,21 @@ from pydub import AudioSegment
 from foreign_whispers.voice_resolution import resolve_speaker_wav
 
 # ── Chatterbox API configuration ─────────────────────────────────────
-CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", "http://localhost:8020")
+# Inside Docker, the API container reaches Chatterbox at the service
+# hostname `foreign-whispers-tts` (set via FW_CHATTERBOX_API_URL in
+# docker-compose.yml). The legacy CHATTERBOX_API_URL var is kept as a
+# fallback for host-side notebook callers that talk to localhost:8020.
+CHATTERBOX_API_URL = (
+    os.getenv("FW_CHATTERBOX_API_URL")
+    or os.getenv("CHATTERBOX_API_URL")
+    or "http://localhost:8020"
+)
 # Path to the default speaker reference WAV, relative to pipeline_data/speakers/
 CHATTERBOX_SPEAKER_WAV = os.getenv("CHATTERBOX_SPEAKER_WAV", "")
+# Per-request read timeout. CPU-mode Chatterbox spends ~80 s synthesising a
+# single short sentence; the previous 60 s default caused most segments to
+# time out, leaving long stretches of silence in the assembled output.
+_HTTP_READ_TIMEOUT_S = int(os.getenv("FW_TTS_HTTP_TIMEOUT", "") or "600")
 
 # Set FW_ALIGNMENT=off to use the pre-alignment baseline (legacy unclamped stretch).
 # Default is "on" (new clamped path). Useful for A/B comparisons.
@@ -81,7 +94,7 @@ class ChatterboxClient:
         resp = requests.post(
             f"{self.base_url}/v1/audio/speech",
             json={"input": text, "response_format": "wav"},
-            timeout=(5, 60),
+            timeout=(5, _HTTP_READ_TIMEOUT_S),
         )
         resp.raise_for_status()
         return resp.content
@@ -105,7 +118,7 @@ class ChatterboxClient:
                 f"{self.base_url}/v1/audio/speech/upload",
                 data={"input": text, "response_format": "wav"},
                 files={"voice_file": (wav_path.name, f, "audio/wav")},
-                timeout=(5, 60),
+                timeout=(5, _HTTP_READ_TIMEOUT_S),
             )
         resp.raise_for_status()
         return resp.content
@@ -130,17 +143,41 @@ class ChatterboxClient:
 def _make_tts_engine():
     """Create TTS engine: Chatterbox API client if server is reachable, else local Coqui.
 
-    Tries Chatterbox with a real /v1/audio/speech test call
-    to ensure the model is fully loaded before committing.
+    Tries Chatterbox with a real /v1/audio/speech test call to ensure the
+    model is fully loaded before committing. On a cold container start the
+    sidecar may still be warming up — poll up to ~5 minutes via /health
+    before falling back to Coqui, so a brief startup race doesn't condemn
+    the whole process to the (much weaker, frequently broken) local engine.
     """
-    try:
-        client = ChatterboxClient()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            client.tts_to_file(text="prueba", file_path=tmp.name)
-        print(f"[tts] Using Chatterbox GPU server at {CHATTERBOX_API_URL}")
-        return client
-    except Exception as exc:
-        print(f"[tts] Chatterbox not available ({exc}), falling back to local Coqui")
+    backend = os.getenv("FW_TTS_BACKEND", "remote").lower()
+    if backend == "remote":
+        # Wait for /health 200, then validate with a real probe synthesis.
+        deadline = time.time() + 300  # 5-minute startup window
+        last_err: Exception | None = None
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                r = requests.get(f"{CHATTERBOX_API_URL}/health", timeout=(3, 5))
+                if r.status_code == 200 and r.json().get("model_loaded"):
+                    client = ChatterboxClient()
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                        client.tts_to_file(text="prueba", file_path=tmp.name)
+                    print(f"[tts] Using Chatterbox server at {CHATTERBOX_API_URL} (after {attempt} probe(s))")
+                    return client
+            except Exception as exc:
+                last_err = exc
+            time.sleep(5)
+        # Remote backend explicitly requested but Chatterbox never came up —
+        # fail loudly rather than silently routing to a broken Coqui.
+        raise RuntimeError(
+            f"FW_TTS_BACKEND=remote but Chatterbox at {CHATTERBOX_API_URL} did not become "
+            f"ready within 5 min ({attempt} probes, last error: {last_err}). "
+            f"Check `docker compose ps` and `docker logs foreign-whispers-tts`."
+        )
+
+    # backend != "remote": fall through to local Coqui below.
+    print(f"[tts] FW_TTS_BACKEND={backend!r} — using local Coqui")
 
     # Fallback: local Coqui TTS (for dev/test without Docker)
     import functools
