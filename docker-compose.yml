@@ -130,6 +130,10 @@ services:
       # re-export inside the container as FW_HF_TOKEN (what Settings looks for)
       - FW_HF_TOKEN=${FW_HF_TOKEN:-}
       - FW_LOGFIRE_WRITE_TOKEN=${FW_LOGFIRE_WRITE_TOKEN:-}
+      # TTS tuning (see .env.example)
+      - FW_TTS_HTTP_TIMEOUT=${FW_TTS_HTTP_TIMEOUT:-}
+      # Dev affordance — truncate downloads to first N seconds for fast iteration
+      - FW_DOWNLOAD_DURATION_SECONDS=${FW_DOWNLOAD_DURATION_SECONDS:-}
       # OpenRouter — no FW_ prefix; consumed directly by foreign_whispers.reranking
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
@@ -138,6 +142,8 @@ services:
       - ./pipeline_data:/app/pipeline_data
       - ./foreign_whispers:/app/foreign_whispers
       - ./api:/app/api
+      # Hot-mount the registry so adding videos doesn't require an image rebuild.
+      - ./video_registry.yml:/app/video_registry.yml:ro
 
   # ── Frontend (Next.js) — all profiles ──────────────────────────────
   frontend:

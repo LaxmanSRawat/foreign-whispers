@@ -126,6 +126,8 @@ These are real, code-read env vars worth knowing. Grep the source if in doubt.
 - `CHATTERBOX_API_URL` — direct URL the TTS engine module reads (parallels `FW_CHATTERBOX_API_URL` in `core/config.py`); default `http://localhost:8020`.
 - `FW_ALIGNMENT` — `"on"` (default) or `"off"` to bypass duration-aware alignment in `text_file_to_speech`.
 - `FW_TTS_WORKERS` — TTS synthesis parallelism (default `3`).
+- `FW_TTS_HTTP_TIMEOUT` — per-request read timeout (seconds) for Chatterbox calls. Default `600`. CPU synthesis takes ~80 s for a short sentence; the previous hard-coded 60 s timeout silently dropped most segments. Lower to `60` on GPU if you want faster failure.
+- `FW_DOWNLOAD_DURATION_SECONDS` — **dev affordance**. When set to a positive int, the download stage fetches only the first N seconds of every YouTube video (via yt-dlp `download_ranges`). Lets the slow CPU TTS stage finish in ~10 min instead of ~75 for a full clip. Leave unset/empty/0 for normal full-length downloads.
 - `FW_USE_GPU_ENCODE` — when set, video stitching uses GPU encoding ([api/src/services/stitch_engine.py:135](api/src/services/stitch_engine.py#L135)).
 - `IMAGEMAGICK_BINARY` — ImageMagick path for moviepy text rendering.
 - `YT_COOKIES_FILE` — yt-dlp cookies (default `/app/cookies.txt`).
