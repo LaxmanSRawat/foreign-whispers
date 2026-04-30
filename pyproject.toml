@@ -28,6 +28,9 @@ dependencies = [
     "logfire[fastapi]",
     "pyannote.audio",
     "datasets>=4.8.4",
+    # For evaluation.dubbing_scorecard's semantic-fidelity dimension. The
+    # all-MiniLM-L6-v2 model is ~22 MB; downloads on first use.
+    "sentence-transformers>=2.2",
 ]
 
 [dependency-groups]

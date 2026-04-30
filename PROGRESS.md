@@ -62,20 +62,10 @@ Notebook: [notebooks/diarization_integration/diarization_integration.ipynb](note
 
 Notebook: [notebooks/alignment_integration/alignment_integration.ipynb](notebooks/alignment_integration/alignment_integration.ipynb)
 
-- [ ] **Task 1 · Improve TTS duration prediction**
-  - **File:** [foreign_whispers/alignment.py](foreign_whispers/alignment.py), the `_estimate_duration` helper.
-  - **Goal:** replace the crude ~15 chars/sec heuristic with a better predictor — syllable-based, or a regression model trained on ground-truth TTS durations.
-  - **Note:** commit `aa3b9c3 refactor: extract _estimate_duration helper from SegmentMetrics` already extracted the helper; the *replacement* of the heuristic is still pending.
-- [ ] **Task 2 · Duration-aware translation re-ranking** *(same stub as Notebook 3)*
-  - **File:** [foreign_whispers/reranking.py](foreign_whispers/reranking.py)
-  - **Goal:** for segments tagged `REQUEST_SHORTER`, generate shorter candidates that fit the timing budget.
-- [ ] **Task 3 · Beat the greedy optimizer**
-  - **File:** [foreign_whispers/alignment.py](foreign_whispers/alignment.py)
-  - **Goal:** implement `global_align_dp()` using DP, ILP, or beam search to beat the greedy left-to-right scheduler.
-  - **Acceptance:** lower total drift, fewer severe stretches, fewer overlaps vs the greedy baseline.
-- [ ] **Task 4 · Dubbing quality scorecard**
-  - **File:** [foreign_whispers/evaluation.py](foreign_whispers/evaluation.py)
-  - **Goal:** design a multi-dimensional evaluator covering timing accuracy, intelligibility (STT round-trip), semantic fidelity (embedding similarity), and naturalness (speaking-rate variance).
+- [x] **Task 1 · Improve TTS duration prediction** — replaced the syllables/4.5 heuristic with a closed-form linear regression on `(chars, syllables, words)` in [foreign_whispers/alignment.py:48](foreign_whispers/alignment.py#L48). MAE on the Hormuz training pairs dropped **0.608 s → 0.186 s (–69%)**. Legacy formula kept as `_estimate_duration_baseline()` for A/B comparison in the notebook.
+- [x] **Task 2 · Duration-aware translation re-ranking** — wired `get_shorter_translations()` into the notebook (function was already implemented as the 3-stage hybrid in earlier project work; no source change needed). Notebook cell shows action-distribution before vs after re-ranking.
+- [x] **Task 3 · Beat the greedy optimizer** — `global_align_dp()` added at [foreign_whispers/alignment.py:303](foreign_whispers/alignment.py#L303). Forward DP over `(segment_index, drift_quantum)` state with cost = `overflow + severe_stretch + drift²`; the drift² term is the lookahead lever. Three new tests cover greedy parity, total-cost dominance, and real-clip no-regression.
+- [x] **Task 4 · Dubbing quality scorecard** — `dubbing_scorecard()` in [foreign_whispers/evaluation.py:55](foreign_whispers/evaluation.py#L55) returns timing, naturalness, intelligibility, and semantic sub-scores in [0, 1] plus an overall mean. Heavy services (Whisper STT, back-translator, embedder) injected as `typing.Protocol` classes so unit tests can mock them.
 
 ---
 

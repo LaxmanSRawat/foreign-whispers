@@ -165,19 +165,19 @@ Key conventions:
 
 The alignment/evaluation library imported by the API:
 
-- **[foreign_whispers/alignment.py](foreign_whispers/alignment.py)** — `compute_segment_metrics(en, es) → list[SegmentMetrics]`, `global_align(metrics, silence_regions, max_stretch=1.4) → list[AlignedSegment]`, and the `AlignAction` enum with five outcomes:
+- **[foreign_whispers/alignment.py](foreign_whispers/alignment.py)** — `compute_segment_metrics(en, es) → list[SegmentMetrics]` (using linear regression for baseline duration estimation), `global_align(metrics, silence_regions, max_stretch=1.4) → list[AlignedSegment]` (O(n) greedy), `global_align_dp(metrics, silence_regions) → list[AlignedSegment]` (forward DP scheduler), and the `AlignAction` enum with five outcomes:
   - `ACCEPT` — ≤10% over the source window.
   - `MILD_STRETCH` — 10–40% over; safe to time-stretch with pyrubberband.
   - `GAP_SHIFT` — 40–80% over; consume adjacent silence.
   - `REQUEST_SHORTER` — 80–150% over; ask for a reranked shorter translation.
   - `FAIL` — >150% over.
-  - Single-pass O(n) greedy scheduler with cumulative drift tracking.
+  - Includes both a single-pass O(n) greedy scheduler and a DP scheduler with lookahead drift tracking.
 - **[foreign_whispers/backends.py](foreign_whispers/backends.py)** — `DurationAwareTTSBackend` ABC for future duration-controlled TTS; current implementations use the simpler `TTSBackend` in [api/src/inference/base.py](api/src/inference/base.py).
 - **[foreign_whispers/voice_resolution.py](foreign_whispers/voice_resolution.py)** — `resolve_speaker_wav(speakers_dir, target_language, speaker_id=None)` → relative WAV path for Chatterbox voice cloning.
 - **[foreign_whispers/vad.py](foreign_whispers/vad.py)** — `detect_speech_activity()` wraps Silero VAD.
 - **[foreign_whispers/diarization.py](foreign_whispers/diarization.py)** — `diarize_audio()` wraps pyannote.audio (needs `FW_HF_TOKEN`).
 - **[foreign_whispers/reranking.py](foreign_whispers/reranking.py)** — `get_shorter_translations()` produces shorter alternatives when alignment returns `REQUEST_SHORTER`.
-- **[foreign_whispers/evaluation.py](foreign_whispers/evaluation.py)** — `clip_evaluation_report(metrics, aligned)` writes the `.align.json` sidecar.
+- **[foreign_whispers/evaluation.py](foreign_whispers/evaluation.py)** — `clip_evaluation_report(metrics, aligned)` writes the `.align.json` sidecar. Also features `dubbing_scorecard(...)` for complete dubbing evaluation (timing, naturalness, intelligibility, semantics) using injected `typing.Protocol` dependencies.
 
 **Integration trace.** [api/src/services/tts_engine.py](api/src/services/tts_engine.py) `text_file_to_speech` calls `_build_alignment()` → for each segment reads `aligned_seg.action` and routes accordingly: `REQUEST_SHORTER` triggers `get_shorter_translations()`; `MILD_STRETCH` is applied post-synthesis via `pyrubberband` in `_postprocess_segment()`; finally `clip_evaluation_report()` writes the `.align.json` sidecar.
 

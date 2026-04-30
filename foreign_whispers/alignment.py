@@ -33,12 +33,53 @@ def _count_syllables(text: str) -> int:
     return max(1, len(clusters))
 
 
-_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
+_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages — legacy baseline
+
+
+def _estimate_duration_baseline(text: str) -> float:
+    """Legacy ``syllables / 4.5`` heuristic.
+
+    Kept around as a sibling of :func:`_estimate_duration` (the fitted
+    predictor) so that notebooks and tests can A/B compare the two
+    formulas honestly — without inlining the formula in five places.
+    """
+    return _count_syllables(text) / _SYLLABLE_RATE
+
+
+# Linear-regression coefficients for ``_estimate_duration``.
+#
+# Fitted via ``numpy.linalg.lstsq`` on every ``(text, raw_duration_s)`` pair
+# extracted from the project's ``.align.json`` sidecars after a Chatterbox
+# CPU run on the 90 s "Strait of Hormuz" clip (38 Spanish segments).  The
+# closed-form ``chars / 15`` and ``syllables / 4.5`` heuristics both have
+# MAE ≈ 0.6 s on this dataset; the fitted predictor below brings MAE down
+# to ~0.19 s (a 69 % reduction).  Re-fit by re-running Notebook 5 cell 11
+# whenever a larger corpus of TTS ground truth is available.
+_DUR_COEF_CHARS  =  0.05099
+_DUR_COEF_SYLL   =  0.01307
+_DUR_COEF_WORDS  = -0.02277
+_DUR_BIAS        =  0.31209
 
 
 def _estimate_duration(text: str) -> float:
-    """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    return _count_syllables(text) / _SYLLABLE_RATE
+    """Estimate TTS duration in seconds for *text*.
+
+    Linear combination of three cheap features (character count, syllable
+    count via :func:`_count_syllables`, and whitespace word count) trained
+    on real Chatterbox output — see the constants above for provenance.
+    Returns at least ``1 / _SYLLABLE_RATE`` so a degenerate prediction
+    never lands below a single syllable's worth of time.
+    """
+    chars = len(text)
+    syll = _count_syllables(text)
+    words = max(1, len(text.split()))
+    pred = (
+        _DUR_COEF_CHARS * chars
+        + _DUR_COEF_SYLL * syll
+        + _DUR_COEF_WORDS * words
+        + _DUR_BIAS
+    )
+    return max(1.0 / _SYLLABLE_RATE, pred)
 
 
 @dataclasses.dataclass
@@ -296,5 +337,159 @@ def global_align(
         ))
 
         cumulative_drift += gap_shift
+
+    return aligned
+
+
+def global_align_dp(
+    metrics:           list[SegmentMetrics],
+    silence_regions:   list[dict],
+    max_stretch:       float = 1.4,
+    *,
+    overflow_weight:   float = 1.0,
+    severe_penalty:    float = 0.5,
+    drift_penalty:     float = 0.1,
+    drift_quantum_s:   float = 0.1,
+) -> list[AlignedSegment]:
+    """Dynamic-programming alignment scheduler — the lookahead counterpart
+    to :func:`global_align`.
+
+    Greedy picks a *single* action per segment based on the local thresholds
+    in :func:`decide_action`.  This optimiser enumerates every feasible
+    action at every segment and runs forward DP, picking the action sequence
+    that minimises a weighted cost function::
+
+        cost = overflow_weight · residual_overflow_s
+             + severe_penalty   · 1{stretch > 1.4}
+             + drift_penalty    · cumulative_drift_s²
+
+    The drift-squared term is what makes DP non-trivially better than
+    greedy — it penalises *future* drift introduced by *current*
+    ``GAP_SHIFT`` choices, so the optimiser learns to skip a gap-shift
+    when accepting a small overflow now is cheaper than carrying drift
+    through the rest of the timeline.
+
+    DP guarantees: every action greedy considers is also a DP candidate,
+    so the optimal DP cost is always ≤ the greedy cost on the same input.
+    Empirically this also tends to lower the per-axis numbers in
+    :func:`foreign_whispers.evaluation.clip_evaluation_report` (drift,
+    severe-stretch count, total overflow).
+
+    Args:
+        metrics, silence_regions, max_stretch: same semantics as
+            :func:`global_align`.
+        overflow_weight, severe_penalty, drift_penalty: cost coefficients
+            (kwargs so the notebook can sweep them).
+        drift_quantum_s: drift discretisation step.  Smaller = more
+            precise lookahead but exponentially more states.  0.1 s is a
+            sensible default for clips ≤ a few minutes.
+
+    Returns:
+        One ``AlignedSegment`` per input metric, in order.
+    """
+    from functools import lru_cache
+
+    n = len(metrics)
+    if n == 0:
+        return []
+
+    def _silence_after(end_s: float) -> float:
+        for r in silence_regions:
+            if r.get("label") == "silence" and r["start_s"] >= end_s - 0.1:
+                return r["end_s"] - r["start_s"]
+        return 0.0
+
+    gaps = [_silence_after(m.source_end) for m in metrics]
+
+    def _candidates(i: int, drift_s: float):
+        """Yield ``(action, gap_shift_s, stretch_factor, local_cost)``
+        tuples for every feasible action at segment ``i``."""
+        m   = metrics[i]
+        gap = gaps[i]
+        drift_cost = drift_penalty * drift_s ** 2
+
+        # ACCEPT — no modification, pay overflow as cost.
+        yield (
+            AlignAction.ACCEPT, 0.0, 1.0,
+            overflow_weight * m.overflow_s + drift_cost,
+        )
+
+        # MILD_STRETCH — capped at max_stretch; any residual overflow stays.
+        capped   = max(1.0, min(m.predicted_stretch, max_stretch))
+        residual = max(0.0, m.predicted_tts_s - m.source_duration_s * capped)
+        severe   = severe_penalty if capped > 1.4 else 0.0
+        yield (
+            AlignAction.MILD_STRETCH, 0.0, capped,
+            overflow_weight * residual + severe + drift_cost,
+        )
+
+        # GAP_SHIFT — only when the available silence can absorb the overflow.
+        if m.overflow_s > 0 and gap >= m.overflow_s:
+            new_drift = drift_s + m.overflow_s
+            yield (
+                AlignAction.GAP_SHIFT, m.overflow_s, 1.0,
+                drift_penalty * new_drift ** 2,  # replaces drift_cost
+            )
+
+        # REQUEST_SHORTER — only meaningful for over-budget segments;
+        # keeps schedule but flags the segment for re-translation.
+        if m.predicted_stretch > 1.8:
+            yield (
+                AlignAction.REQUEST_SHORTER, 0.0, 1.0,
+                overflow_weight * m.overflow_s + 1.0 + drift_cost,
+            )
+
+        # FAIL — last resort, highest fixed cost on top of overflow.
+        yield (
+            AlignAction.FAIL, 0.0, 1.0,
+            overflow_weight * m.overflow_s + 2.0 + drift_cost,
+        )
+
+    @lru_cache(maxsize=None)
+    def _value(i: int, drift_q: int) -> float:
+        """Best total cost from segment ``i`` to end, given ``drift_q``
+        drift quanta have already been accumulated."""
+        if i == n:
+            return 0.0
+        drift_s = drift_q * drift_quantum_s
+        best = float("inf")
+        for _, gap_shift, _, local in _candidates(i, drift_s):
+            shift_q = round(gap_shift / drift_quantum_s)
+            cost = local + _value(i + 1, drift_q + shift_q)
+            if cost < best:
+                best = cost
+        return best
+
+    # Forward reconstruction — at each step choose the action whose
+    # local_cost + V(i+1, drift') matches V(i, drift).
+    aligned: list[AlignedSegment] = []
+    drift_q = 0
+    for i, m in enumerate(metrics):
+        drift_s = drift_q * drift_quantum_s
+        target = _value(i, drift_q)
+        chosen: tuple | None = None
+        for action, gap_shift, stretch, local in _candidates(i, drift_s):
+            shift_q = round(gap_shift / drift_quantum_s)
+            if abs(local + _value(i + 1, drift_q + shift_q) - target) < 1e-9:
+                chosen = (action, gap_shift, stretch, shift_q)
+                break
+        assert chosen is not None  # invariant: at least one action matches V
+
+        action, gap_shift, stretch, shift_q = chosen
+        sched_start = m.source_start + drift_s
+        sched_end   = sched_start + m.source_duration_s + gap_shift
+
+        aligned.append(AlignedSegment(
+            index           = m.index,
+            original_start  = m.source_start,
+            original_end    = m.source_end,
+            scheduled_start = sched_start,
+            scheduled_end   = sched_end,
+            text            = m.translated_text,
+            action          = action,
+            gap_shift_s     = gap_shift,
+            stretch_factor  = stretch,
+        ))
+        drift_q += shift_q
 
     return aligned
