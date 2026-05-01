@@ -472,6 +472,7 @@ def text_file_to_speech(
     *,
     alignment=None,
     target_language: str = "es",
+    speaker_wav: str | None = None,
 ):
     """Read translated JSON with segment timestamps and produce a time-aligned WAV.
 
@@ -492,6 +493,10 @@ def text_file_to_speech(
     field (added by the diarize stage) picks a voice via
     :func:`foreign_whispers.voice_resolution.resolve_speaker_wav`; segments
     without a ``speaker`` fall back to the language default.
+
+    *speaker_wav* overrides automatic voice resolution with an explicit
+    reference WAV path (relative to ``pipeline_data/speakers/``).  When
+    provided, every segment uses this voice regardless of diarization labels.
     """
     engine = tts_engine if tts_engine is not None else _get_tts_engine()
     use_alignment = alignment if alignment is not None else _ALIGNMENT_ENABLED
@@ -551,12 +556,20 @@ def text_file_to_speech(
         })
 
     # ── Resolve per-speaker reference voices ──────────────────────────
-    # One lookup per distinct speaker (not per segment) — diarize typically
-    # emits a handful of speakers across hundreds of segments.
-    voice_map = _build_speaker_voice_map(segments, target_language)
-    distinct_voices = sorted(set(voice_map.values()))
-    if len(distinct_voices) > 1 or any(v for v in distinct_voices):
-        print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
+    # When the caller provides an explicit speaker_wav, use it uniformly
+    # for every segment (API-level override).  Otherwise fall back to
+    # per-speaker resolution via diarization labels.
+    if speaker_wav is not None:
+        # Uniform override — every segment uses the same voice.
+        voice_map = {seg.get("speaker"): speaker_wav for seg in segments}
+        print(f" (speaker_wav override: {speaker_wav})", end="")
+    else:
+        # One lookup per distinct speaker (not per segment) — diarize
+        # typically emits a handful of speakers across hundreds of segments.
+        voice_map = _build_speaker_voice_map(segments, target_language)
+        distinct_voices = sorted(set(voice_map.values()))
+        if len(distinct_voices) > 1 or any(v for v in distinct_voices):
+            print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
 
     # ── Phase 1: GPU synthesis (concurrent) ───────────────────────────
     # Submit all TTS calls to a thread pool so the GPU stays busy while

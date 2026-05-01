@@ -24,11 +24,16 @@ class TTSService:
         *,
         alignment: bool | None = None,
         target_language: str = "es",
+        speaker_wav: str | None = None,
     ) -> None:
         """Generate time-aligned TTS audio from a translated JSON transcript.
 
         *target_language* selects the per-speaker voice directory under
         ``pipeline_data/speakers/{target_language}/``.
+
+        *speaker_wav* overrides automatic voice resolution with an explicit
+        reference WAV path (relative to ``pipeline_data/speakers/``).
+        When ``None``, per-speaker resolution runs via diarization labels.
         """
         tts_text_file_to_speech(
             source_path,
@@ -36,6 +41,7 @@ class TTSService:
             self.tts_engine,
             alignment=alignment,
             target_language=target_language,
+            speaker_wav=speaker_wav,
         )
 
     @staticmethod
