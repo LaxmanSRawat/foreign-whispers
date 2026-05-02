@@ -32,6 +32,12 @@ CHATTERBOX_SPEAKER_WAV = os.getenv("CHATTERBOX_SPEAKER_WAV", "")
 # time out, leaving long stretches of silence in the assembled output.
 _HTTP_READ_TIMEOUT_S = int(os.getenv("FW_TTS_HTTP_TIMEOUT", "") or "600")
 
+# Chatterbox sampling temperature. The API minimum is 0.05; lower values
+# reduce per-call stochastic variation. There is no seed parameter in the
+# Chatterbox API or underlying model, so temperature is the only lever for
+# narrowing variance short of the speaker-warmup strategy below.
+_CHATTERBOX_TEMPERATURE = float(os.getenv("FW_TTS_TEMPERATURE", "") or "0.05")
+
 # Set FW_ALIGNMENT=off to use the pre-alignment baseline (legacy unclamped stretch).
 # Default is "on" (new clamped path). Useful for A/B comparisons.
 _ALIGNMENT_ENABLED = os.getenv("FW_ALIGNMENT", "on").lower() != "off"
@@ -93,7 +99,7 @@ class ChatterboxClient:
         """Call /v1/audio/speech with the server's default voice."""
         resp = requests.post(
             f"{self.base_url}/v1/audio/speech",
-            json={"input": text, "response_format": "wav"},
+            json={"input": text, "response_format": "wav", "temperature": _CHATTERBOX_TEMPERATURE},
             timeout=(5, _HTTP_READ_TIMEOUT_S),
         )
         resp.raise_for_status()
@@ -116,12 +122,24 @@ class ChatterboxClient:
         with open(wav_path, "rb") as f:
             resp = requests.post(
                 f"{self.base_url}/v1/audio/speech/upload",
-                data={"input": text, "response_format": "wav"},
+                data={"input": text, "response_format": "wav", "temperature": str(_CHATTERBOX_TEMPERATURE)},
                 files={"voice_file": (wav_path.name, f, "audio/wav")},
                 timeout=(5, _HTTP_READ_TIMEOUT_S),
             )
         resp.raise_for_status()
         return resp.content
+
+    def synthesize_warmup_reference(self, speaker_wav: str) -> bytes:
+        """Synthesize a short fixed phrase to produce a stable per-speaker voice anchor.
+
+        Returns raw WAV bytes synthesized from *speaker_wav*. Callers save this
+        as a temporary file and use it as the cloning reference for all real
+        segments of that speaker, replacing the raw recorded reference WAV.
+        This anchors synthesis variance to one consistent model output rather
+        than to the training-set recording.
+        """
+        warmup_text = "Hola, voy a hablar ahora."
+        return self._synthesize_with_voice(warmup_text, speaker_wav)
 
     @staticmethod
     def _split_text(text: str, max_len: int = 200) -> list[str]:
@@ -256,6 +274,60 @@ def _build_speaker_voice_map(
     }
 
 
+def _build_warmup_voice_map(
+    engine,
+    voice_map: dict[str | None, str],
+    work_dir: str,
+) -> dict[str | None, str]:
+    """Synthesize one warmup WAV per distinct reference voice; return updated map.
+
+    Keys are the same speaker labels as *voice_map*. Values are absolute paths
+    to temporary WAV files in *work_dir* containing synthesized warmup audio.
+    If synthesis fails for a voice, that entry retains the original static
+    reference WAV path (graceful fallback — never raises).
+
+    Only runs when *engine* is a :class:`ChatterboxClient`; returns *voice_map*
+    unchanged for other engines (e.g. local Coqui).
+    """
+    if not isinstance(engine, ChatterboxClient):
+        return voice_map
+
+    warmup_map: dict[str | None, str] = {}
+    seen_wavs: dict[str, str] = {}  # original_wav → warmup_path (deduplicate)
+    logger = _logging.getLogger(__name__)
+
+    for speaker, ref_wav in voice_map.items():
+        if ref_wav in seen_wavs:
+            warmup_map[speaker] = seen_wavs[ref_wav]
+            continue
+        try:
+            warmup_bytes = engine.synthesize_warmup_reference(ref_wav)
+            warmup_path = str(pathlib.Path(work_dir) / f"warmup_{speaker or 'default'}.wav")
+            pathlib.Path(warmup_path).write_bytes(warmup_bytes)
+            warmup_map[speaker] = warmup_path
+            seen_wavs[ref_wav] = warmup_path
+            logger.info("[tts] warmup synthesized for speaker=%s ref=%s → %s", speaker, ref_wav, warmup_path)
+        except Exception as exc:
+            logger.warning("[tts] warmup failed for speaker=%s (%s), using raw reference", speaker, exc)
+            warmup_map[speaker] = ref_wav
+
+    return warmup_map
+
+
+def _sanitize_tts_text(text: str) -> str:
+    """Strip markdown artifacts and control characters that cause CUDA token asserts in Chatterbox."""
+    import re
+    # Strip leading markdown punctuation (>, #, *, -, bullets) that slip through from translation.
+    # Also strip inverted Spanish punctuation (¿, ¡) — TTS models don't need them and
+    # leading ¿ with voice cloning deterministically triggers a CUDA device-side assert.
+    text = re.sub(r'^[\s>#+\-*•·¿¡]+', '', text)
+    # Remove any remaining markdown bold/italic markers mid-text
+    text = re.sub(r'[*_]{1,3}', '', text)
+    # Strip bracketed links but keep the link text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    return text.strip()
+
+
 def _synthesize_raw(
     tts_engine,
     text: str,
@@ -268,6 +340,7 @@ def _synthesize_raw(
     cloning (currently :class:`ChatterboxClient`). Engines without cloning
     support — e.g. local Coqui — receive the call without the kwarg.
     """
+    text = _sanitize_tts_text(text)
     if not text or not text.strip():
         return None
     try:
@@ -585,6 +658,49 @@ def text_file_to_speech(
     distinct_voices = sorted(set(voice_map.values()))
     if len(distinct_voices) > 1 or any(v for v in distinct_voices):
         print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
+
+    # ── Phase 0 + 1: warmup then GPU synthesis ────────────────────────
+    # Both phases share one temp directory so warmup WAVs (absolute paths)
+    # stay alive throughout Phase 1 synthesis.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _TTS_WORKERS = int(os.getenv("FW_TTS_WORKERS", "3"))
+    _WARMUP_ENABLED = os.getenv("FW_TTS_WARMUP", "on").lower() != "off"
+
+    raw_wav_map: dict[int, bytes | None] = {}
+
+    with tempfile.TemporaryDirectory() as synth_dir:
+        # ── Phase 0: per-speaker warmup ───────────────────────────────
+        # Synthesize one short phrase per distinct reference voice and use
+        # the result as the cloning reference for all real segments of that
+        # speaker. This anchors all segments to a consistent model output
+        # instead of to the raw recorded reference WAV, dramatically reducing
+        # inter-segment voice drift caused by Chatterbox's stochastic sampling.
+        if _WARMUP_ENABLED:
+            n_distinct = len(set(voice_map.values()))
+            print(f" (warmup: {n_distinct} voice(s))", end="")
+            voice_map = _build_warmup_voice_map(engine, voice_map, synth_dir)
+
+        # ── Phase 1: GPU synthesis (concurrent) ───────────────────────
+        # Submit all TTS calls to a thread pool so the GPU stays busy while
+        # previous results are being downloaded / decoded.
+        def _do_synth(idx: int, text: str, speaker_wav: str | None) -> tuple[int, bytes | None]:
+            wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
+            return idx, _synthesize_raw(engine, text, wav_path, speaker_wav=speaker_wav)
+
+        with ThreadPoolExecutor(max_workers=_TTS_WORKERS) as pool:
+            futures = {
+                pool.submit(
+                    _do_synth,
+                    m["index"],
+                    m["text"],
+                    voice_map.get(segments[m["index"]].get("speaker")),
+                ): m["index"]
+                for m in seg_metas
+            }
+            for fut in as_completed(futures):
+                idx, raw_bytes = fut.result()
+                raw_wav_map[idx] = raw_bytes
+
 
     print(f" ({len(segments)} segments synthesized)", end="")
 

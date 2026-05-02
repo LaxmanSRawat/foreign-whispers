@@ -140,6 +140,8 @@ These are real, code-read env vars worth knowing. Grep the source if in doubt.
 - `FW_ALIGNMENT` — `"on"` (default) or `"off"` to bypass duration-aware alignment in `text_file_to_speech`.
 - `FW_TTS_WORKERS` — TTS synthesis parallelism (default `3`).
 - `FW_TTS_HTTP_TIMEOUT` — per-request read timeout (seconds) for Chatterbox calls. Default `600`. CPU synthesis takes ~80 s for a short sentence; the previous hard-coded 60 s timeout silently dropped most segments. Lower to `60` on GPU if you want faster failure.
+- `FW_TTS_WARMUP` — `"on"` (default) or `"off"`. When on, synthesizes one short warmup phrase per distinct speaker voice before the main synthesis loop and uses the synthesized output as the cloning reference for all segments of that speaker. Eliminates inter-segment voice drift from Chatterbox's stochastic sampling. Disable for fast CPU dev runs or A/B comparisons.
+- `FW_TTS_TEMPERATURE` — float (default `0.05`). Sampling temperature passed to Chatterbox on every synthesis call. API range 0.05–5.0; lower values reduce per-call variation. There is no seed parameter in the Chatterbox API, so this is the only direct lever for narrowing variance.
 - `FW_DOWNLOAD_DURATION_SECONDS` — **dev affordance**. When set to a positive int, the download stage fetches only the first N seconds of every YouTube video (via yt-dlp `download_ranges`). Lets the slow CPU TTS stage finish in ~10 min instead of ~75 for a full clip. Leave unset/empty/0 for normal full-length downloads.
 - `FW_USE_GPU_ENCODE` — when set, video stitching uses GPU encoding ([api/src/services/stitch_engine.py:135](api/src/services/stitch_engine.py#L135)).
 - `IMAGEMAGICK_BINARY` — ImageMagick path for moviepy text rendering.
