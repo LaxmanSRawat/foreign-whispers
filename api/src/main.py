@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     logger.info("Application ready (models will load on first use).")
 
     # Configure Logfire if a write token is available
-    if settings.logfire_write_token:
+    if settings.logfire_write_token and not getattr(app.state, "_logfire_instrumented", False):
         try:
             import logfire
             logfire.configure(
@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
                 service_name="foreign-whispers",
             )
             logfire.instrument_fastapi(app)
+            app.state._logfire_instrumented = True
             logger.info("Logfire tracing enabled.")
         except ImportError:
             logger.info("Logfire not installed — tracing disabled.")

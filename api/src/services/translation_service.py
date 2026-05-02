@@ -1,6 +1,8 @@
 """HTTP-agnostic service wrapping translation engine functions."""
 
+import asyncio
 import copy
+import inspect
 import pathlib
 from pathlib import Path
 
@@ -66,6 +68,18 @@ class TranslationService:
         from foreign_whispers.alignment import AlignAction, compute_segment_metrics, decide_action
         from foreign_whispers.reranking import get_shorter_translations
 
+        def _resolve_candidates(candidates_or_awaitable):
+            if not inspect.isawaitable(candidates_or_awaitable):
+                return candidates_or_awaitable
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(candidates_or_awaitable)
+            # This service method is synchronous; if it is called from an
+            # async context, leave the original translation untouched rather
+            # than trying to nest event loops.
+            return []
+
         result = copy.deepcopy(es_transcript)
         metrics = compute_segment_metrics(en_transcript, es_transcript)
 
@@ -76,12 +90,14 @@ class TranslationService:
             prev = segs[m.index - 1]["text"] if m.index > 0 else ""
             nxt  = segs[m.index + 1]["text"] if m.index < len(segs) - 1 else ""
 
-            candidates = get_shorter_translations(
-                source_text       = m.source_text,
-                baseline_es       = m.translated_text,
-                target_duration_s = m.source_duration_s,
-                context_prev      = prev,
-                context_next      = nxt,
+            candidates = _resolve_candidates(
+                get_shorter_translations(
+                    source_text       = m.source_text,
+                    baseline_es       = m.translated_text,
+                    target_duration_s = m.source_duration_s,
+                    context_prev      = prev,
+                    context_next      = nxt,
+                )
             )
 
             if candidates:

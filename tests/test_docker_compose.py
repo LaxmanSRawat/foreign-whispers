@@ -17,9 +17,10 @@ def test_api_service_exists(compose_config):
     assert "api" in compose_config["services"]
 
 
-def test_api_service_uses_network_mode_host(compose_config):
-    """API service must use host networking (port 8080)."""
-    assert compose_config["services"]["api"].get("network_mode") == "host"
+def test_api_service_exposes_ports(compose_config):
+    """API service must expose port 8080."""
+    ports = compose_config["services"]["api"].get("ports", [])
+    assert any("8080" in str(p) for p in ports)
 
 
 def test_api_service_has_uvicorn_command(compose_config):

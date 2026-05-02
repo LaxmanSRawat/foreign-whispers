@@ -198,13 +198,16 @@ def _make_tts_engine():
 
 
 _tts_engine = None
+# Backwards-compatible alias used by older callers/tests.
+tts = None
 
 
 def _get_tts_engine():
     """Lazy singleton — resolved on first call, not at import time."""
-    global _tts_engine
+    global _tts_engine, tts
     if _tts_engine is None:
         _tts_engine = _make_tts_engine()
+        tts = _tts_engine
     return _tts_engine
 
 
@@ -335,15 +338,31 @@ def _postprocess_segment(raw_wav_bytes: bytes | None, target_sec: float,
     return (segment_audio, speed_factor, raw_duration)
 
 
-def _synced_segment_audio(tts_engine, text: str, target_sec: float, work_dir, stretch_factor: float = 1.0, alignment_enabled: bool = True) -> tuple:
+def _synced_segment_audio(
+    tts_engine,
+    text: str,
+    target_sec: float,
+    work_dir,
+    stretch_factor: float = 1.0,
+    alignment_enabled: bool | None = None,
+    speaker_wav: str | None = None,
+) -> tuple:
     """Generate TTS audio for *text* and time-stretch it to *target_sec*.
 
     Convenience wrapper kept for callers that don't use the batch path.
     """
     if target_sec <= 0:
         return (None, 0.0, 0.0)
+    if not text or not text.strip():
+        return (AudioSegment.silent(duration=int(target_sec * 1000)), 1.0, 0.0)
+
+    if alignment_enabled is None:
+        alignment_enabled = _ALIGNMENT_ENABLED
+
     raw_wav = str(pathlib.Path(work_dir) / "raw_segment.wav")
-    raw_bytes = _synthesize_raw(tts_engine, text, raw_wav)
+    raw_bytes = _synthesize_raw(tts_engine, text, raw_wav, speaker_wav=speaker_wav)
+    if isinstance(raw_bytes, (str, os.PathLike)):
+        raw_bytes = pathlib.Path(raw_bytes).read_bytes()
     return _postprocess_segment(raw_bytes, target_sec, stretch_factor, alignment_enabled, str(work_dir))
 
 
@@ -567,36 +586,9 @@ def text_file_to_speech(
     if len(distinct_voices) > 1 or any(v for v in distinct_voices):
         print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
 
-    # ── Phase 1: GPU synthesis (concurrent) ───────────────────────────
-    # Submit all TTS calls to a thread pool so the GPU stays busy while
-    # previous results are being downloaded / decoded.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    _TTS_WORKERS = int(os.getenv("FW_TTS_WORKERS", "3"))
-
-    raw_wav_map: dict[int, bytes | None] = {}
-
-    with tempfile.TemporaryDirectory() as synth_dir:
-        def _do_synth(idx: int, text: str, speaker_wav: str | None) -> tuple[int, bytes | None]:
-            wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
-            return idx, _synthesize_raw(engine, text, wav_path, speaker_wav=speaker_wav)
-
-        with ThreadPoolExecutor(max_workers=_TTS_WORKERS) as pool:
-            futures = {
-                pool.submit(
-                    _do_synth,
-                    m["index"],
-                    m["text"],
-                    voice_map.get(segments[m["index"]].get("speaker")),
-                ): m["index"]
-                for m in seg_metas
-            }
-            for fut in as_completed(futures):
-                idx, raw_bytes = fut.result()
-                raw_wav_map[idx] = raw_bytes
-
     print(f" ({len(segments)} segments synthesized)", end="")
 
-    # ── Phase 2: CPU post-processing (sequential assembly) ────────────
+    # ── Sequential assembly ────────────────────────────────────────────
     with tempfile.TemporaryDirectory() as tmpdir:
         combined = AudioSegment.empty()
         cursor_ms = 0
@@ -610,9 +602,14 @@ def text_file_to_speech(
                 combined += AudioSegment.silent(duration=start_ms - cursor_ms)
                 cursor_ms = start_ms
 
-            seg_audio, seg_speed_factor, seg_raw_duration = _postprocess_segment(
-                raw_wav_map[i], m["target_sec"], m["stretch_factor"],
-                use_alignment, tmpdir,
+            seg_audio, seg_speed_factor, seg_raw_duration = _synced_segment_audio(
+                engine,
+                m["text"],
+                m["target_sec"],
+                tmpdir,
+                stretch_factor=m["stretch_factor"],
+                alignment_enabled=use_alignment,
+                speaker_wav=voice_map.get(segments[i].get("speaker")),
             )
 
             aligned_seg = m["aligned_seg"]
