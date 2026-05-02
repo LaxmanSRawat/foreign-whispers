@@ -4,9 +4,16 @@ import asyncio
 import copy
 import inspect
 import pathlib
+import re
 from pathlib import Path
 
 from api.src.services import translation_engine as _te
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split translated text into sentences on . ? ! boundaries."""
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
 def download_and_install_package(from_code: str, to_code: str):
@@ -37,13 +44,29 @@ class TranslationService:
     def translate_transcript(self, transcript: dict, from_code: str, to_code: str) -> dict:
         """Translate all segments and full text in a transcript dict.
 
+        Translates the full paragraph as a single unit so argostranslate has
+        sentence-level context (e.g. "60 Minutes Overtime" vs "over time"),
+        then splits the result back to individual segments. Falls back to
+        per-segment translation when the sentence count doesn't match.
+
         Returns a deep copy; the original is not mutated.
         """
         result = copy.deepcopy(transcript)
-        for segment in result.get("segments", []):
-            segment["text"] = translate_sentence(segment["text"], from_code, to_code)
-        result["text"] = translate_sentence(result.get("text", ""), from_code, to_code)
+        segments = result.get("segments", [])
+
+        full_source = " ".join(s["text"].strip() for s in segments)
+        full_translation = translate_sentence(full_source, from_code, to_code)
+        result["text"] = full_translation
         result["language"] = to_code
+
+        translated_parts = _split_sentences(full_translation)
+        if len(translated_parts) == len(segments):
+            for seg, text in zip(segments, translated_parts):
+                seg["text"] = text
+        else:
+            for seg in segments:
+                seg["text"] = translate_sentence(seg["text"], from_code, to_code)
+
         return result
 
     def rerank_for_duration(

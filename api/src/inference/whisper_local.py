@@ -34,7 +34,7 @@ class LocalWhisperBackend(WhisperBackend):
             "Transcribing %s with local Whisper (%s) on %s",
             audio_path, self._model_name, self._device,
         )
-        return self._model.transcribe(audio_path)
+        return self._model.transcribe(audio_path, language="en")
 
     def __repr__(self) -> str:
         return f"<LocalWhisperBackend model={self._model_name!r} device={self._device!r}>"

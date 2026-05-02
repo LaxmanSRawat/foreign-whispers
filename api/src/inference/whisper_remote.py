@@ -27,7 +27,7 @@ class RemoteWhisperBackend(WhisperBackend):
             response = requests.post(
                 url,
                 files={"file": (audio_path, f, "audio/wav")},
-                data={"response_format": "verbose_json"},
+                data={"response_format": "verbose_json", "language": "en"},
                 timeout=300,
             )
 
