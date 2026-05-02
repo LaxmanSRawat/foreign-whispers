@@ -24,6 +24,7 @@ class TTSService:
         *,
         alignment: bool | None = None,
         target_language: str = "es",
+        speaker_wav: str | None = None,
     ) -> None:
         """Generate time-aligned TTS audio from a translated JSON transcript.
 
@@ -36,6 +37,7 @@ class TTSService:
             self.tts_engine,
             alignment=alignment,
             target_language=target_language,
+            speaker_wav=speaker_wav,
         )
 
     @staticmethod

@@ -472,6 +472,7 @@ def text_file_to_speech(
     *,
     alignment=None,
     target_language: str = "es",
+    speaker_wav: str | None = None,
 ):
     """Read translated JSON with segment timestamps and produce a time-aligned WAV.
 
@@ -554,6 +555,10 @@ def text_file_to_speech(
     # One lookup per distinct speaker (not per segment) — diarize typically
     # emits a handful of speakers across hundreds of segments.
     voice_map = _build_speaker_voice_map(segments, target_language)
+    # Explicit speaker_wav overrides the auto-resolved default for
+    # un-diarized segments (which key under None in the voice map).
+    if speaker_wav:
+        voice_map[None] = speaker_wav
     distinct_voices = sorted(set(voice_map.values()))
     if len(distinct_voices) > 1 or any(v for v in distinct_voices):
         print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")

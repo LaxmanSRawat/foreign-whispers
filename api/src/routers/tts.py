@@ -28,6 +28,7 @@ async def tts_endpoint(
     config: str = Query(..., pattern=r"^c-[0-9a-f]{7}$"),
     alignment: bool = Query(False),
     target_language: str = Query("es", pattern=r"^[a-z]{2}(-[A-Z]{2})?$"),
+    speaker_wav: str | None = Query(None, description="Reference voice WAV path relative to speakers dir (e.g. 'es/default.wav')"),
 ):
     """Generate TTS audio for a translated transcript.
 
@@ -35,6 +36,8 @@ async def tts_endpoint(
     *alignment* enables temporal alignment (clamped stretch).
     *target_language* picks the speaker-voice directory under
     ``pipeline_data/speakers/{target_language}/``.
+    *speaker_wav* overrides the auto-resolved reference voice for
+    un-diarized segments.
     """
     trans_dir = settings.translations_dir
     audio_dir = settings.tts_audio_dir / config
@@ -67,6 +70,7 @@ async def tts_endpoint(
         str(audio_dir),
         alignment=alignment,
         target_language=target_language,
+        speaker_wav=speaker_wav,
     )
 
     return {
