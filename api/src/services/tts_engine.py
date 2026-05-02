@@ -556,20 +556,16 @@ def text_file_to_speech(
         })
 
     # ── Resolve per-speaker reference voices ──────────────────────────
-    # When the caller provides an explicit speaker_wav, use it uniformly
-    # for every segment (API-level override).  Otherwise fall back to
-    # per-speaker resolution via diarization labels.
-    if speaker_wav is not None:
-        # Uniform override — every segment uses the same voice.
-        voice_map = {seg.get("speaker"): speaker_wav for seg in segments}
-        print(f" (speaker_wav override: {speaker_wav})", end="")
-    else:
-        # One lookup per distinct speaker (not per segment) — diarize
-        # typically emits a handful of speakers across hundreds of segments.
-        voice_map = _build_speaker_voice_map(segments, target_language)
-        distinct_voices = sorted(set(voice_map.values()))
-        if len(distinct_voices) > 1 or any(v for v in distinct_voices):
-            print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
+    # One lookup per distinct speaker (not per segment) — diarize typically
+    # emits a handful of speakers across hundreds of segments.
+    voice_map = _build_speaker_voice_map(segments, target_language)
+    # Explicit speaker_wav overrides the auto-resolved default for
+    # un-diarized segments (which key under None in the voice map).
+    if speaker_wav:
+        voice_map[None] = speaker_wav
+    distinct_voices = sorted(set(voice_map.values()))
+    if len(distinct_voices) > 1 or any(v for v in distinct_voices):
+        print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
 
     # ── Phase 1: GPU synthesis (concurrent) ───────────────────────────
     # Submit all TTS calls to a thread pool so the GPU stays busy while

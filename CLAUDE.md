@@ -60,6 +60,19 @@ docker compose --profile nvidia build api
 docker compose --profile nvidia up -d api
 ```
 
+### Pre-pull the Whisper model (one-time)
+
+The speaches container starts with `WHISPER__MODEL` set but does **not** auto-download — `/v1/audio/transcriptions` returns 422 (`Field required: model`) or `Model '…' is not installed locally` until the model is fetched. Pull it once after first `up`; the named volume `whisper-cache` keeps it across rebuilds and restarts:
+
+```bash
+# nvidia profile
+curl -X POST "http://localhost:8000/v1/models/Systran/faster-whisper-medium"
+# cpu profile
+curl -X POST "http://localhost:8000/v1/models/Systran/faster-whisper-small"
+```
+
+Verify with `curl http://localhost:8000/v1/models`. Re-pull is only needed after `docker compose down -v` or `docker volume rm foreign-whispers_whisper-cache`. Any HTTP client that hits `/v1/audio/transcriptions` directly (e.g. the Task 4 `WhisperHTTPAdapter` in [notebooks/alignment_integration/alignment_integration.ipynb](notebooks/alignment_integration/alignment_integration.ipynb)) must include the `model` form field — speaches' OpenAPI schema lists it as required.
+
 ### Makefile shortcuts
 
 `make help` lists everything. The most useful targets (defined in [Makefile](Makefile)):
