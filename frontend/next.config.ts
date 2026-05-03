@@ -3,7 +3,7 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   output: "standalone",
   experimental: {
-    proxyTimeout: 600_000, // 10 minutes — TTS can take several minutes on CPU
+    proxyTimeout: 1_800_000, // 30 minutes — CPU TTS on a full-length clip exceeds 10 min
   },
   async rewrites() {
     return [

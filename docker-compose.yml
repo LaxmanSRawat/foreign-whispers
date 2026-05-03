@@ -1,5 +1,5 @@
 services:
-  # ── STT (Speech-to-Text) — GPU only ────────────────────────────────
+  # ── STT (Speech-to-Text) — GPU ──────────────────────────────────────
   whisper-gpu:
     container_name: foreign-whispers-stt
     profiles: [nvidia]
@@ -25,7 +25,29 @@ services:
       retries: 3
       start_period: 30s
 
-  # ── TTS (Text-to-Speech) — Chatterbox on GPU ──────────────────────
+  # ── STT (Speech-to-Text) — CPU fallback ─────────────────────────────
+  whisper-cpu:
+    container_name: foreign-whispers-stt
+    profiles: [cpu]
+    platform: linux/amd64   # image has no arm64 build; Rosetta 2 emulates it on Apple Silicon
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - whisper-cache:/home/ubuntu/.cache/huggingface/hub
+    environment:
+      # Use a smaller model by default on CPU for acceptable speed.
+      # Override with FW_WHISPER_MODEL if you need higher accuracy.
+      - WHISPER__MODEL=Systran/faster-whisper-small
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://0.0.0.0:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── TTS (Text-to-Speech) — Chatterbox on GPU ───────────────────────
   chatterbox-gpu:
     container_name: foreign-whispers-tts
     profiles: [nvidia]
@@ -41,6 +63,12 @@ services:
     volumes:
       - chatterbox-models:/app/models
       - ./pipeline_data/speakers:/app/voices
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8020/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
     deploy:
       resources:
         reservations:
@@ -49,8 +77,33 @@ services:
               count: all
               capabilities: [gpu]
 
-  # ── API (CPU orchestrator) — all profiles ─────────────────────────
-  # The API container is CPU-only. It delegates GPU work to the STT
+  # ── TTS (Text-to-Speech) — Chatterbox on CPU ────────────────────────
+  chatterbox-cpu:
+    container_name: foreign-whispers-tts
+    profiles: [cpu]
+    platform: linux/amd64   # image has no arm64 build; Rosetta 2 emulates it on Apple Silicon
+    image: travisvn/chatterbox-tts-api:latest
+    restart: unless-stopped
+    # Reduce shared-memory footprint; CPU inference needs far less.
+    shm_size: "2gb"
+    ports:
+      - "8020:8020"
+    environment:
+      - DEVICE=cpu
+      - DEFAULT_MODEL=multilingual
+      - PORT=8020
+    volumes:
+      - chatterbox-models:/app/models
+      - ./pipeline_data/speakers:/app/voices
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8020/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+  # ── API (CPU orchestrator) — all profiles ──────────────────────────
+  # The API container is CPU-only. It delegates inference to the STT
   # and TTS containers above via HTTP.
   api:
     container_name: foreign-whispers-api
@@ -62,16 +115,35 @@ services:
         USER_UID: "${UID:-1000}"
         USER_GID: "${GID:-1000}"
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8080:8080"
     command: ["uv", "run", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
-      - CHATTERBOX_API_URL=http://localhost:8020
-      - FW_WHISPER_MODEL=base
+      # Use Docker Compose service names (not localhost) so containers
+      # can reach each other inside the Compose network.
+      - FW_CHATTERBOX_API_URL=http://foreign-whispers-tts:8020
+      - FW_WHISPER_API_URL=http://foreign-whispers-stt:8000
+      # remote = delegate to the speaches/chatterbox containers
+      - FW_WHISPER_BACKEND=remote
+      - FW_TTS_BACKEND=remote
+      # HF token — accept either FW_HF_TOKEN or FW_HF_TOKEN from .env,
+      # re-export inside the container as FW_HF_TOKEN (what Settings looks for)
+      - FW_HF_TOKEN=${FW_HF_TOKEN:-}
+      - FW_LOGFIRE_WRITE_TOKEN=${FW_LOGFIRE_WRITE_TOKEN:-}
+      # TTS tuning (see .env.example)
+      - FW_TTS_HTTP_TIMEOUT=${FW_TTS_HTTP_TIMEOUT:-}
+      # Dev affordance — truncate downloads to first N seconds for fast iteration
+      - FW_DOWNLOAD_DURATION_SECONDS=${FW_DOWNLOAD_DURATION_SECONDS:-}
+      # OpenRouter — no FW_ prefix; consumed directly by foreign_whispers.reranking
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
+      - OPENROUTER_LEARN=${OPENROUTER_LEARN:-1}
     volumes:
       - ./pipeline_data:/app/pipeline_data
       - ./foreign_whispers:/app/foreign_whispers
       - ./api:/app/api
-      - ./cookies.txt:/app/cookies.txt
+      # Hot-mount the registry so adding videos doesn't require an image rebuild.
+      - ./video_registry.yml:/app/video_registry.yml:ro
 
   # ── Frontend (Next.js) — all profiles ──────────────────────────────
   frontend:
@@ -80,14 +152,22 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Baked into the standalone Next.js build because next.config.ts
+        # rewrites() are evaluated at build time, not at runtime.
+        API_URL: http://api:8080
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8501:8501"
     environment:
-      - API_URL=http://localhost:8080
+      - API_URL=http://api:8080
       - HOSTNAME=0.0.0.0
       - PORT=8501
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8501"]
+      # Use 127.0.0.1 — the container's /etc/hosts maps `localhost` to ::1
+      # only, while next-server binds IPv4. wget against `localhost` returns
+      # "connection refused" even though the server is healthy.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8501"]
       interval: 15s
       timeout: 5s
       retries: 3

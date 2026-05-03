@@ -4,6 +4,179 @@
 
 YouTube video dubbing pipeline — transcribe, translate, and dub 60 Minutes interviews into a target language.
 
+---
+
+## Student Submission Notes
+
+### Notebook Integration Work
+
+Each integration notebook introduced one stage of the pipeline. Below is a summary of the implementation approach taken per notebook and the reasoning behind it.
+
+---
+
+#### Notebook 1 — Download Integration *(no coding)*
+
+Explored the `yt-dlp`-backed download stage via the `FWClient.download()` SDK method. The notebook establishes the `{start, end, text}` segment-dict format that every downstream stage consumes. Artifacts land in `pipeline_data/api/videos/` (MP4) and `pipeline_data/api/youtube_captions/` (JSON).
+
+---
+
+#### Notebook 2 — Transcription Integration *(no coding)*
+
+Compared two transcription sources:
+
+| Mode | Approach | Pros | Cons |
+|------|----------|------|------|
+| `use_youtube_captions=True` | Parses auto-generated captions from yt-dlp | Fast, no GPU | Coarser timing, inconsistent quality |
+| `use_youtube_captions=False` | Runs Whisper STT on the audio track | Accurate timestamps, uniform quality | Requires GPU, slower |
+
+**Decision:** Whisper was chosen for the final pipeline. YouTube captions for the Hormuz video produced 170 short, fragmented segments with uneven timing. Whisper produced 98 cleaner segments with acoustically-grounded boundaries, which gave the alignment stage a more reliable source window to work with.
+
+---
+
+#### Notebook 3 — Translation Integration
+
+**Task: Duration-aware re-ranking (`get_shorter_translations`)**
+
+The argostranslate offline translator has no duration budget — it expands Spanish text by ~10–30% over English on average. When a translated segment is too long to synthesise within the source window, a shorter alternative is needed.
+
+**Approach:** A three-stage hybrid in `foreign_whispers/reranking.py`:
+
+1. **Learned cache** — memoises previously shortened segments to avoid re-generating on repeat runs.
+2. **Rule-based contractions** — applies a hand-curated shortening dictionary for common Spanish phrases (e.g. "horas extra" → "extras"). Zero network dependency.
+3. **OpenRouter LLM fallback** — calls an LLM via `OPENROUTER_API_KEY` when rules don't produce a candidate short enough. Falls back gracefully when the key is absent.
+
+The hybrid is conservative: it only invokes the more expensive stage when the cheaper one fails to find a fitting candidate.
+
+---
+
+#### Notebook 4 — Diarization Integration *(5 tasks)*
+
+**Task 1: `assign_speakers` merge function**
+
+Implemented in `foreign_whispers/diarization.py`. For each Whisper segment, finds the pyannote diarization interval with the greatest temporal overlap (`max(0, min(seg_end, diar_end) - max(seg_start, diar_start))`) and copies its speaker label. Defaults to `SPEAKER_00` when diarization is empty — keeping the function backwards-compatible with non-diarized runs. All 4 TDD unit tests pass.
+
+**Task 2: `POST /api/diarize/{video_id}` endpoint**
+
+Created `api/src/routers/diarize.py` and `api/src/schemas/diarize.py`. The endpoint extracts a 16 kHz mono WAV via ffmpeg, runs pyannote, caches the result as JSON, and returns a `DiarizeResponse`. A cache check at the top of the handler means subsequent calls skip pyannote entirely and return `skipped: true`.
+
+**Task 3: Merge speaker labels into transcription**
+
+After diarization, `_merge_labels_into_transcript` in the diarize router writes speaker fields into both `transcriptions/{title}.json` and `translations/{title}.json`. Merging into the translation JSON is essential — the TTS engine reads from the translation file, so without this fix per-speaker voice selection silently fell back to the default voice on every segment.
+
+**Task 4: Frontend pipeline integration**
+
+Added a `diarize` stage to the frontend between Transcribe and Translate in `frontend/src/hooks/use-pipeline.ts` and `frontend/src/components/pipeline-table.tsx`. The stage is conditional — it only runs when diarization is enabled in settings, so the pipeline remains functional without a HuggingFace token.
+
+**Task 5: Per-speaker TTS voice selection**
+
+`_build_speaker_voice_map` in `tts_engine.py` resolves one reference WAV per distinct speaker using a **round-robin with fallback** strategy (implemented in `foreign_whispers/voice_resolution.py`):
+
+1. Non-default WAVs in `speakers/{lang}/` are sorted alphabetically; the speaker index (extracted from the label, e.g. `SPEAKER_02` → 2) selects a file via modulo — so `N` speakers share `K` voice files without manual naming.
+2. Falls back to `speakers/{lang}/default.wav`, then `speakers/default.wav`.
+
+Round-robin was chosen over explicit name mapping because it requires no per-speaker configuration — dropping additional WAV files into the language directory automatically distributes them across speakers.
+
+A concurrency race was also fixed: `ThreadPoolExecutor` workers uploading different voice references simultaneously caused cross-speaker voice bleed. The fix sorts segment submissions by resolved voice key before entering the pool so same-voice segments are always batched together.
+
+---
+
+#### Notebook 5 — Alignment Integration *(4 tasks)*
+
+**Task 1: Improve TTS duration prediction**
+
+The baseline heuristic (`syllables / 4.5 ≈ 15 chars/sec`) ignores character density and word boundaries. Ground-truth durations were collected from `.align.json` sidecars produced by prior TTS runs.
+
+**Approach:** Closed-form linear regression on three text features — character count, syllable count, and word count — fitted on the 38-segment Hormuz training corpus. Coefficients are baked into `alignment.py` as constants (`_DUR_COEF_CHARS`, `_DUR_COEF_SYLL`, `_DUR_COEF_WORDS`, `_DUR_BIAS`), so there is no model file to load and no runtime overhead. MAE dropped from **0.608 s → 0.186 s (−69%)**.
+
+**Task 2: Duration-aware translation re-ranking**
+
+Wired `get_shorter_translations()` (already implemented in Notebook 3) into the alignment loop. For each `REQUEST_SHORTER` segment the function is called, the shortest candidate within the ~15 chars/s budget is selected, substituted into a copy of the translation, and metrics are recomputed. The action-distribution before/after comparison confirmed that re-ranking moves over-budget segments into `MILD_STRETCH` or `ACCEPT`.
+
+**Task 3: Beat the greedy optimizer (`global_align_dp`)**
+
+The greedy `global_align` scheduler makes locally optimal decisions and cannot look ahead. Implemented `global_align_dp` in `alignment.py` — a forward DP over the state `(segment_index, cumulative_drift_quantum)` with cost = `overflow + severe_stretch_indicator + drift²`.
+
+**Why DP is strictly better:** the drift² term penalises carrying gap debt forward, so the optimiser learns to skip a gap-shift when the local overflow penalty is cheaper than propagating drift through the rest of the timeline. Every action greedy considers is also a DP candidate, making DP provably ≤ greedy cost. Drift is quantised to 0.1 s to keep state size manageable.
+
+**Task 4: Multi-dimensional dubbing quality scorecard**
+
+`dubbing_scorecard()` in `foreign_whispers/evaluation.py` returns sub-scores in [0, 1] across four dimensions:
+
+| Dimension | Method |
+|-----------|--------|
+| Timing | Penalises severe stretches and cumulative drift (not raw duration error) |
+| Naturalness | Speaking-rate variance across segments |
+| Intelligibility | Word error rate of a Whisper STT round-trip on the synthesised audio |
+| Semantic fidelity | Cosine similarity of `all-MiniLM-L6-v2` embeddings of source English vs back-translated English |
+
+Heavy services (Whisper, back-translator, embedder) are injected as `typing.Protocol` interfaces so unit tests can mock them without loading model weights.
+
+---
+
+#### Notebook 6 — TTS Integration *(4 tasks)*
+
+**Task 1: Understand the existing Chatterbox client** *(no coding)*
+
+Explored `ChatterboxClient` in `tts_engine.py`. The client routes requests to `/v1/audio/speech` (default voice) or `/v1/audio/speech/upload` (voice cloning with a reference WAV). Baseline vs aligned modes were compared by measuring total WAV duration — aligned mode time-stretches each segment via `pyrubberband` to match the source window.
+
+**Task 2: `resolve_speaker_wav` voice resolution function**
+
+Implemented in `foreign_whispers/voice_resolution.py`. Returns a path relative to `pipeline_data/speakers/` so the Chatterbox container can resolve it via its `/app/voices/` mount. All 5 TDD unit tests pass.
+
+**Task 3: Add `speaker_wav` to the TTS API**
+
+Added `speaker_wav: str | None` as a query parameter to `POST /api/tts/{video_id}`. Forwarded through `tts_service.py` → `tts_engine.py`. When present, it overrides the `None`-keyed entry in the voice map (used for un-diarized segments), keeping backwards compatibility with non-diarized runs.
+
+**Task 4: Per-speaker voice assignment verified end-to-end**
+
+After diarization runs and speaker labels are merged into the translation JSON, `_build_speaker_voice_map` automatically assigns a distinct reference WAV to each speaker. Verified with the Hormuz video: two speakers (`SPEAKER_00`, `SPEAKER_01`) were detected and mapped to separate voice files from `pipeline_data/speakers/es/`.
+
+A voice warmup step (`FW_TTS_WARMUP=on`, enabled by default) synthesises one short phrase per distinct speaker voice before the main synthesis loop and uses the output as the cloning reference for all segments of that speaker. This eliminates inter-segment voice drift caused by Chatterbox's stochastic sampling.
+
+---
+
+#### Notebook 7 — Stitch Integration *(no coding)*
+
+The stitch stage performs audio-only ffmpeg remux: the original video stream is copied as-is (`-c:v copy`), and only the audio track is replaced with the synthesised TTS output. Rolling two-line VTT captions are generated alongside the video — the current translated segment appears on top and the previous segment below, providing continuity for the viewer. No video re-encoding means zero quality loss on the video track.
+
+---
+
+### Challenges
+
+#### 1. Missing Spanish reference voice files
+
+The `pipeline_data/speakers/es/` directory was empty on first run, causing Chatterbox to fall back to its built-in voice for every segment — eliminating the naturalness benefit of voice cloning. We researched OpenSLR (a public corpus of multilingual speech recordings) and downloaded four Spanish reference WAVs (`clf_` female and `clm_` male prefixes) that matched the expected audio format and quality for Chatterbox's voice cloning endpoint.
+
+#### 2. CPU → GPU migration mid-project
+
+Initial development was done on a Mac, which required updating the Docker setup to run the STT and TTS engines in CPU-only mode. CPU Chatterbox synthesis ran at **1–2 it/s**, making a full pipeline run for a 6-minute video take approximately 75 minutes. When TTS throughput became a bottleneck, the setup was migrated to a gaming laptop with an NVIDIA GPU, which brought synthesis throughput up to **6–8 it/s** and reduced full-video pipeline time to approximately 10 minutes. Both `cpu` and `nvidia` Docker Compose profiles were maintained throughout so either environment could be used.
+
+---
+
+### Results
+
+#### Output videos
+
+Dubbed videos and translated captions for all four input videos from the registry are available on Google Drive:
+
+- **Dubbed Videos:** `https://drive.google.com/drive/folders/198QkExc3AztUaDazo8ux88XSUjMHKeXD?usp=sharing`
+- **Translated Captions (VTT):** `https://drive.google.com/drive/folders/1tkEq0ABqZYMXveAiyPVZRiQxJ0wwwm_f?usp=sharing`
+
+#### Conclusion
+
+All four videos in `video_registry.yml` were successfully dubbed into Spanish. The configuration that produced the best results was:
+
+| Stage | Choice | Why |
+|-------|--------|-----|
+| Transcription | **Whisper STT** (not YouTube captions) | More accurate acoustic timestamps; YouTube captions were fragmented and had coarser timing |
+| Speaker identification | **Diarization** (pyannote) + per-speaker voice assignment | Distinct voices per speaker make multi-speaker interviews sound natural |
+| TTS timing | **Aligned** mode | Each synthesised segment is time-stretched only when necessary, keeping the audio in sync with the video |
+| Video assembly | **Original stitch code** (ffmpeg audio remux) | No re-encoding preserves video quality; rolling VTT captions provide translated subtitles |
+
+This combination produced translated videos where speaker voices are natural and audio segments are only stretched when they genuinely exceed the source window. This avoids the "whale sound" distortion that occurred in earlier runs, where shorter audio clips were stretched aggressively based on a crude character-count heuristic regardless of how well they already fit the timing budget.
+
+---
+
 ## Architecture
 
 ```mermaid

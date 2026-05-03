@@ -1,17 +1,20 @@
 # Foreign Whispers — Docker Compose helpers
 PROFILE := --profile nvidia
 DC      := docker compose $(PROFILE)
-API     := api-gpu
+API     := foreign-whispers-api
 NB      := notebooks/foreign_whispers_pipeline.ipynb
 
 # ── Docker lifecycle ──────────────────────────────────────────────────────
-.PHONY: build up down logs ps
+.PHONY: build up down logs ps cpu
 
 build:                ## Rebuild the API image
 	$(DC) build $(API)
 
-up:                   ## Start all services
+up:                   ## Start all services (GPU/NVIDIA profile)
 	$(DC) up -d
+
+cpu:                  ## Start all services in CPU-only mode (no NVIDIA required)
+	docker compose --profile cpu up -d
 
 down:                 ## Stop all services
 	$(DC) down

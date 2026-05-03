@@ -84,7 +84,7 @@ def test_text_file_to_speech_calls_alignment(tmp_path):
 
     called_with_stretch = []
 
-    def fake_synced(engine, text, target_sec, work_dir, stretch_factor=1.0):
+    def fake_synced(engine, text, target_sec, work_dir, stretch_factor=1.0, speaker_wav=None):
         called_with_stretch.append(stretch_factor)
         from pydub import AudioSegment
         return AudioSegment.silent(duration=int(target_sec * 1000)), 1.0, target_sec
@@ -121,7 +121,7 @@ def test_text_file_to_speech_missing_en_transcript(tmp_path):
 
     called_with_stretch = []
 
-    def fake_synced(engine, text, target_sec, work_dir, stretch_factor=1.0):
+    def fake_synced(engine, text, target_sec, work_dir, stretch_factor=1.0, speaker_wav=None):
         called_with_stretch.append(stretch_factor)
         from pydub import AudioSegment
         return AudioSegment.silent(duration=int(target_sec * 1000)), 1.0, target_sec
@@ -176,7 +176,7 @@ def test_text_file_to_speech_calls_shorten_for_request_shorter(tmp_path):
         shorten_calls.append((en_text, es_text, target_sec))
         return es_text
 
-    def fake_synced(engine, text, target_sec, work_dir, stretch_factor=1.0):
+    def fake_synced(engine, text, target_sec, work_dir, stretch_factor=1.0, speaker_wav=None):
         from pydub import AudioSegment
         return AudioSegment.silent(duration=int(target_sec * 1000)), 1.0, target_sec
 

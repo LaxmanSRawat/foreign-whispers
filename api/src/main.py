@@ -23,14 +23,15 @@ async def lifespan(app: FastAPI):
     logger.info("Application ready (models will load on first use).")
 
     # Configure Logfire if a write token is available
-    if settings.logfire_write_token:
+    if settings.logfire_write_token and not getattr(app.state, "_logfire_instrumented", False):
         try:
             import logfire
             logfire.configure(
-                write_token=settings.logfire_write_token,
+                token=settings.logfire_write_token,
                 service_name="foreign-whispers",
             )
             logfire.instrument_fastapi(app)
+            app.state._logfire_instrumented = True
             logger.info("Logfire tracing enabled.")
         except ImportError:
             logger.info("Logfire not installed — tracing disabled.")
@@ -86,6 +87,8 @@ def create_app() -> FastAPI:
     from api.src.routers.translate import router as translate_router
     from api.src.routers.tts import router as tts_router
     from api.src.routers.stitch import router as stitch_router
+    #added diarization router
+    from api.src.routers.diarize import router as diarize_router
 
     app.include_router(download_router)
     app.include_router(transcribe_router)
@@ -94,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(stitch_router)
     from api.src.routers.eval import router as eval_router
     app.include_router(eval_router)
+    app.include_router(diarize_router)
 
     @app.get("/healthz")
     async def healthz():

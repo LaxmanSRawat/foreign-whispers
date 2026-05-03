@@ -25,7 +25,12 @@ dependencies = [
     "requests",
     "setuptools<81",
     "pyyaml>=6.0.3",
-    "logfire",
+    "logfire[fastapi]",
+    "pyannote.audio",
+    "datasets>=4.8.4",
+    # For evaluation.dubbing_scorecard's semantic-fidelity dimension. The
+    # all-MiniLM-L6-v2 model is ~22 MB; downloads on first use.
+    "sentence-transformers>=2.2",
 ]
 
 [dependency-groups]
@@ -35,7 +40,7 @@ dev = [
     "nbconvert>=7.17.0",
 ]
 alignment = [
-    "logfire",
+    "logfire[fastapi]",
     "silero-vad",
     "pyannote.audio",
 ]
@@ -56,9 +61,17 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+# On Linux use the CUDA 12.8 wheel index; on macOS fall back to PyPI
+# (which ships MPS-enabled wheels for Apple Silicon).
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

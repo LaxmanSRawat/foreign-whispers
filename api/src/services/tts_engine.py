@@ -7,15 +7,36 @@ import glob
 import tempfile
 
 import requests
+import time
 import librosa
 import soundfile as sf
 import pyrubberband
 from pydub import AudioSegment
 
+from foreign_whispers.voice_resolution import assign_speaker_voices, resolve_speaker_wav
+
 # ── Chatterbox API configuration ─────────────────────────────────────
-CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", "http://localhost:8020")
+# Inside Docker, the API container reaches Chatterbox at the service
+# hostname `foreign-whispers-tts` (set via FW_CHATTERBOX_API_URL in
+# docker-compose.yml). The legacy CHATTERBOX_API_URL var is kept as a
+# fallback for host-side notebook callers that talk to localhost:8020.
+CHATTERBOX_API_URL = (
+    os.getenv("FW_CHATTERBOX_API_URL")
+    or os.getenv("CHATTERBOX_API_URL")
+    or "http://localhost:8020"
+)
 # Path to the default speaker reference WAV, relative to pipeline_data/speakers/
 CHATTERBOX_SPEAKER_WAV = os.getenv("CHATTERBOX_SPEAKER_WAV", "")
+# Per-request read timeout. CPU-mode Chatterbox spends ~80 s synthesising a
+# single short sentence; the previous 60 s default caused most segments to
+# time out, leaving long stretches of silence in the assembled output.
+_HTTP_READ_TIMEOUT_S = int(os.getenv("FW_TTS_HTTP_TIMEOUT", "") or "600")
+
+# Chatterbox sampling temperature. The API minimum is 0.05; lower values
+# reduce per-call stochastic variation. There is no seed parameter in the
+# Chatterbox API or underlying model, so temperature is the only lever for
+# narrowing variance short of the speaker-warmup strategy below.
+_CHATTERBOX_TEMPERATURE = float(os.getenv("FW_TTS_TEMPERATURE", "") or "0.05")
 
 # Set FW_ALIGNMENT=off to use the pre-alignment baseline (legacy unclamped stretch).
 # Default is "on" (new clamped path). Useful for A/B comparisons.
@@ -78,8 +99,8 @@ class ChatterboxClient:
         """Call /v1/audio/speech with the server's default voice."""
         resp = requests.post(
             f"{self.base_url}/v1/audio/speech",
-            json={"input": text, "response_format": "wav"},
-            timeout=(5, 60),
+            json={"input": text, "response_format": "wav", "temperature": _CHATTERBOX_TEMPERATURE},
+            timeout=(5, _HTTP_READ_TIMEOUT_S),
         )
         resp.raise_for_status()
         return resp.content
@@ -101,12 +122,24 @@ class ChatterboxClient:
         with open(wav_path, "rb") as f:
             resp = requests.post(
                 f"{self.base_url}/v1/audio/speech/upload",
-                data={"input": text, "response_format": "wav"},
+                data={"input": text, "response_format": "wav", "temperature": str(_CHATTERBOX_TEMPERATURE)},
                 files={"voice_file": (wav_path.name, f, "audio/wav")},
-                timeout=(5, 60),
+                timeout=(5, _HTTP_READ_TIMEOUT_S),
             )
         resp.raise_for_status()
         return resp.content
+
+    def synthesize_warmup_reference(self, speaker_wav: str) -> bytes:
+        """Synthesize a short fixed phrase to produce a stable per-speaker voice anchor.
+
+        Returns raw WAV bytes synthesized from *speaker_wav*. Callers save this
+        as a temporary file and use it as the cloning reference for all real
+        segments of that speaker, replacing the raw recorded reference WAV.
+        This anchors synthesis variance to one consistent model output rather
+        than to the training-set recording.
+        """
+        warmup_text = "Hola, voy a hablar ahora."
+        return self._synthesize_with_voice(warmup_text, speaker_wav)
 
     @staticmethod
     def _split_text(text: str, max_len: int = 200) -> list[str]:
@@ -128,17 +161,41 @@ class ChatterboxClient:
 def _make_tts_engine():
     """Create TTS engine: Chatterbox API client if server is reachable, else local Coqui.
 
-    Tries Chatterbox with a real /v1/audio/speech test call
-    to ensure the model is fully loaded before committing.
+    Tries Chatterbox with a real /v1/audio/speech test call to ensure the
+    model is fully loaded before committing. On a cold container start the
+    sidecar may still be warming up — poll up to ~5 minutes via /health
+    before falling back to Coqui, so a brief startup race doesn't condemn
+    the whole process to the (much weaker, frequently broken) local engine.
     """
-    try:
-        client = ChatterboxClient()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            client.tts_to_file(text="prueba", file_path=tmp.name)
-        print(f"[tts] Using Chatterbox GPU server at {CHATTERBOX_API_URL}")
-        return client
-    except Exception as exc:
-        print(f"[tts] Chatterbox not available ({exc}), falling back to local Coqui")
+    backend = os.getenv("FW_TTS_BACKEND", "remote").lower()
+    if backend == "remote":
+        # Wait for /health 200, then validate with a real probe synthesis.
+        deadline = time.time() + 300  # 5-minute startup window
+        last_err: Exception | None = None
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                r = requests.get(f"{CHATTERBOX_API_URL}/health", timeout=(3, 5))
+                if r.status_code == 200 and r.json().get("model_loaded"):
+                    client = ChatterboxClient()
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                        client.tts_to_file(text="prueba", file_path=tmp.name)
+                    print(f"[tts] Using Chatterbox server at {CHATTERBOX_API_URL} (after {attempt} probe(s))")
+                    return client
+            except Exception as exc:
+                last_err = exc
+            time.sleep(5)
+        # Remote backend explicitly requested but Chatterbox never came up —
+        # fail loudly rather than silently routing to a broken Coqui.
+        raise RuntimeError(
+            f"FW_TTS_BACKEND=remote but Chatterbox at {CHATTERBOX_API_URL} did not become "
+            f"ready within 5 min ({attempt} probes, last error: {last_err}). "
+            f"Check `docker compose ps` and `docker logs foreign-whispers-tts`."
+        )
+
+    # backend != "remote": fall through to local Coqui below.
+    print(f"[tts] FW_TTS_BACKEND={backend!r} — using local Coqui")
 
     # Fallback: local Coqui TTS (for dev/test without Docker)
     import functools
@@ -159,13 +216,16 @@ def _make_tts_engine():
 
 
 _tts_engine = None
+# Backwards-compatible alias used by older callers/tests.
+tts = None
 
 
 def _get_tts_engine():
     """Lazy singleton — resolved on first call, not at import time."""
-    global _tts_engine
+    global _tts_engine, tts
     if _tts_engine is None:
         _tts_engine = _make_tts_engine()
+        tts = _tts_engine
     return _tts_engine
 
 
@@ -196,12 +256,103 @@ def files_from_dir(dir_path) -> list:
     return es_files
 
 
-def _synthesize_raw(tts_engine, text: str, wav_path: str) -> bytes | None:
-    """GPU-bound: call TTS engine and return raw WAV bytes, or None on failure."""
+_SPEAKERS_DIR = pathlib.Path(__file__).resolve().parent.parent.parent.parent / "pipeline_data" / "speakers"
+
+
+def _build_speaker_voice_map(
+    segments: list[dict], target_language: str
+) -> dict[str | None, str]:
+    """Resolve a Chatterbox-relative WAV path for every distinct speaker.
+
+    Returns ``{speaker_label: relative_wav_path}``. Segments without a
+    ``speaker`` field map under ``None`` to the language default.
+
+    Uses position-based round-robin (assign_speaker_voices) so that
+    non-sequential pyannote labels like SPEAKER_00 + SPEAKER_02 still get
+    distinct voices rather than both colliding at index 0.
+    """
+    distinct = list({seg.get("speaker") for seg in segments})
+    named = [s for s in distinct if s is not None]
+    result = assign_speaker_voices(_SPEAKERS_DIR, target_language, named)
+    if None in distinct:
+        result[None] = resolve_speaker_wav(_SPEAKERS_DIR, target_language, None)
+    return result
+
+
+def _build_warmup_voice_map(
+    engine,
+    voice_map: dict[str | None, str],
+    work_dir: str,
+) -> dict[str | None, str]:
+    """Synthesize one warmup WAV per distinct reference voice; return updated map.
+
+    Keys are the same speaker labels as *voice_map*. Values are absolute paths
+    to temporary WAV files in *work_dir* containing synthesized warmup audio.
+    If synthesis fails for a voice, that entry retains the original static
+    reference WAV path (graceful fallback — never raises).
+
+    Only runs when *engine* is a :class:`ChatterboxClient`; returns *voice_map*
+    unchanged for other engines (e.g. local Coqui).
+    """
+    if not isinstance(engine, ChatterboxClient):
+        return voice_map
+
+    warmup_map: dict[str | None, str] = {}
+    seen_wavs: dict[str, str] = {}  # original_wav → warmup_path (deduplicate)
+    logger = _logging.getLogger(__name__)
+
+    for speaker, ref_wav in voice_map.items():
+        if ref_wav in seen_wavs:
+            warmup_map[speaker] = seen_wavs[ref_wav]
+            continue
+        try:
+            warmup_bytes = engine.synthesize_warmup_reference(ref_wav)
+            warmup_path = str(pathlib.Path(work_dir) / f"warmup_{speaker or 'default'}.wav")
+            pathlib.Path(warmup_path).write_bytes(warmup_bytes)
+            warmup_map[speaker] = warmup_path
+            seen_wavs[ref_wav] = warmup_path
+            logger.info("[tts] warmup synthesized for speaker=%s ref=%s → %s", speaker, ref_wav, warmup_path)
+        except Exception as exc:
+            logger.warning("[tts] warmup failed for speaker=%s (%s), using raw reference", speaker, exc)
+            warmup_map[speaker] = ref_wav
+
+    return warmup_map
+
+
+def _sanitize_tts_text(text: str) -> str:
+    """Strip markdown artifacts and control characters that cause CUDA token asserts in Chatterbox."""
+    import re
+    # Strip leading markdown punctuation (>, #, *, -, bullets) that slip through from translation.
+    # Also strip inverted Spanish punctuation (¿, ¡) — TTS models don't need them and
+    # leading ¿ with voice cloning deterministically triggers a CUDA device-side assert.
+    text = re.sub(r'^[\s>#+\-*•·¿¡]+', '', text)
+    # Remove any remaining markdown bold/italic markers mid-text
+    text = re.sub(r'[*_]{1,3}', '', text)
+    # Strip bracketed links but keep the link text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    return text.strip()
+
+
+def _synthesize_raw(
+    tts_engine,
+    text: str,
+    wav_path: str,
+    speaker_wav: str | None = None,
+) -> bytes | None:
+    """GPU-bound: call TTS engine and return raw WAV bytes, or None on failure.
+
+    *speaker_wav* (when provided) is forwarded to engines that support voice
+    cloning (currently :class:`ChatterboxClient`). Engines without cloning
+    support — e.g. local Coqui — receive the call without the kwarg.
+    """
+    text = _sanitize_tts_text(text)
     if not text or not text.strip():
         return None
     try:
-        tts_engine.tts_to_file(text=text, file_path=wav_path)
+        if speaker_wav and isinstance(tts_engine, ChatterboxClient):
+            tts_engine.tts_to_file(text=text, file_path=wav_path, speaker_wav=speaker_wav)
+        else:
+            tts_engine.tts_to_file(text=text, file_path=wav_path)
         return pathlib.Path(wav_path).read_bytes()
     except Exception as exc:
         print(f"[tts] TTS failed for segment ({exc}), using silence")
@@ -265,15 +416,31 @@ def _postprocess_segment(raw_wav_bytes: bytes | None, target_sec: float,
     return (segment_audio, speed_factor, raw_duration)
 
 
-def _synced_segment_audio(tts_engine, text: str, target_sec: float, work_dir, stretch_factor: float = 1.0, alignment_enabled: bool = True) -> tuple:
+def _synced_segment_audio(
+    tts_engine,
+    text: str,
+    target_sec: float,
+    work_dir,
+    stretch_factor: float = 1.0,
+    alignment_enabled: bool | None = None,
+    speaker_wav: str | None = None,
+) -> tuple:
     """Generate TTS audio for *text* and time-stretch it to *target_sec*.
 
     Convenience wrapper kept for callers that don't use the batch path.
     """
     if target_sec <= 0:
         return (None, 0.0, 0.0)
+    if not text or not text.strip():
+        return (AudioSegment.silent(duration=int(target_sec * 1000)), 1.0, 0.0)
+
+    if alignment_enabled is None:
+        alignment_enabled = _ALIGNMENT_ENABLED
+
     raw_wav = str(pathlib.Path(work_dir) / "raw_segment.wav")
-    raw_bytes = _synthesize_raw(tts_engine, text, raw_wav)
+    raw_bytes = _synthesize_raw(tts_engine, text, raw_wav, speaker_wav=speaker_wav)
+    if isinstance(raw_bytes, (str, os.PathLike)):
+        raw_bytes = pathlib.Path(raw_bytes).read_bytes()
     return _postprocess_segment(raw_bytes, target_sec, stretch_factor, alignment_enabled, str(work_dir))
 
 
@@ -395,7 +562,15 @@ def _compute_speech_offset(source_path: str) -> float:
     return yt_start - whisper_start
 
 
-def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=None):
+def text_file_to_speech(
+    source_path,
+    output_path,
+    tts_engine=None,
+    *,
+    alignment=None,
+    target_language: str = "es",
+    speaker_wav: str | None = None,
+):
     """Read translated JSON with segment timestamps and produce a time-aligned WAV.
 
     Each segment is individually synthesized and time-stretched to match its
@@ -408,6 +583,17 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
 
     *alignment* overrides the module-level ``_ALIGNMENT_ENABLED`` flag.
     Pass True for aligned mode, False for baseline, or None to use the env var.
+
+    *target_language* is the BCP-47 / ISO-639-1 code (e.g. ``"es"``) used to
+    select per-speaker reference voices from
+    ``pipeline_data/speakers/{target_language}/``. Each segment's ``speaker``
+    field (added by the diarize stage) picks a voice via
+    :func:`foreign_whispers.voice_resolution.resolve_speaker_wav`; segments
+    without a ``speaker`` fall back to the language default.
+
+    *speaker_wav* overrides automatic voice resolution with an explicit
+    reference WAV path (relative to ``pipeline_data/speakers/``).  When
+    provided, every segment uses this voice regardless of diarization labels.
     """
     engine = tts_engine if tts_engine is not None else _get_tts_engine()
     use_alignment = alignment if alignment is not None else _ALIGNMENT_ENABLED
@@ -466,31 +652,71 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
             "aligned_seg": aligned_seg,
         })
 
-    # ── Phase 1: GPU synthesis (concurrent) ───────────────────────────
-    # Submit all TTS calls to a thread pool so the GPU stays busy while
-    # previous results are being downloaded / decoded.
+    # ── Resolve per-speaker reference voices ──────────────────────────
+    # One lookup per distinct speaker (not per segment) — diarize typically
+    # emits a handful of speakers across hundreds of segments.
+    voice_map = _build_speaker_voice_map(segments, target_language)
+    # Explicit speaker_wav overrides the auto-resolved default for
+    # un-diarized segments (which key under None in the voice map).
+    if speaker_wav:
+        voice_map[None] = speaker_wav
+    distinct_voices = sorted(set(voice_map.values()))
+    if len(distinct_voices) > 1 or any(v for v in distinct_voices):
+        print(f" (voices: {len(voice_map)} speakers → {distinct_voices})", end="")
+
+    # ── Phase 0 + 1: warmup then GPU synthesis ────────────────────────
+    # Both phases share one temp directory so warmup WAVs (absolute paths)
+    # stay alive throughout Phase 1 synthesis.
     from concurrent.futures import ThreadPoolExecutor, as_completed
     _TTS_WORKERS = int(os.getenv("FW_TTS_WORKERS", "3"))
+    _WARMUP_ENABLED = os.getenv("FW_TTS_WARMUP", "on").lower() != "off"
 
     raw_wav_map: dict[int, bytes | None] = {}
 
     with tempfile.TemporaryDirectory() as synth_dir:
-        def _do_synth(idx: int, text: str) -> tuple[int, bytes | None]:
-            wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
-            return idx, _synthesize_raw(engine, text, wav_path)
+        # ── Phase 0: per-speaker warmup ───────────────────────────────
+        # Synthesize one short phrase per distinct reference voice and use
+        # the result as the cloning reference for all real segments of that
+        # speaker. This anchors all segments to a consistent model output
+        # instead of to the raw recorded reference WAV, dramatically reducing
+        # inter-segment voice drift caused by Chatterbox's stochastic sampling.
+        if _WARMUP_ENABLED:
+            n_distinct = len(set(voice_map.values()))
+            print(f" (warmup: {n_distinct} voice(s))", end="")
+            voice_map = _build_warmup_voice_map(engine, voice_map, synth_dir)
 
+        # ── Phase 1: GPU synthesis (concurrent) ───────────────────────
+        # Submit all TTS calls to a thread pool so the GPU stays busy while
+        # previous results are being downloaded / decoded.
+        def _do_synth(idx: int, text: str, speaker_wav: str | None) -> tuple[int, bytes | None]:
+            wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
+            return idx, _synthesize_raw(engine, text, wav_path, speaker_wav=speaker_wav)
+
+        # Sort by resolved voice WAV so same-speaker segments are batched
+        # together in submission order — prevents concurrent workers from
+        # uploading different voice files simultaneously (voice bleed race).
+        ordered_metas = sorted(
+            seg_metas,
+            key=lambda m: voice_map.get(segments[m["index"]].get("speaker"), ""),
+        )
         with ThreadPoolExecutor(max_workers=_TTS_WORKERS) as pool:
             futures = {
-                pool.submit(_do_synth, m["index"], m["text"]): m["index"]
-                for m in seg_metas
+                pool.submit(
+                    _do_synth,
+                    m["index"],
+                    m["text"],
+                    voice_map.get(segments[m["index"]].get("speaker")),
+                ): m["index"]
+                for m in ordered_metas
             }
             for fut in as_completed(futures):
                 idx, raw_bytes = fut.result()
                 raw_wav_map[idx] = raw_bytes
 
+
     print(f" ({len(segments)} segments synthesized)", end="")
 
-    # ── Phase 2: CPU post-processing (sequential assembly) ────────────
+    # ── Sequential assembly ────────────────────────────────────────────
     with tempfile.TemporaryDirectory() as tmpdir:
         combined = AudioSegment.empty()
         cursor_ms = 0
@@ -505,8 +731,11 @@ def text_file_to_speech(source_path, output_path, tts_engine=None, *, alignment=
                 cursor_ms = start_ms
 
             seg_audio, seg_speed_factor, seg_raw_duration = _postprocess_segment(
-                raw_wav_map[i], m["target_sec"], m["stretch_factor"],
-                use_alignment, tmpdir,
+                raw_wav_map.get(i),
+                m["target_sec"],
+                m["stretch_factor"],
+                use_alignment,
+                tmpdir,
             )
 
             aligned_seg = m["aligned_seg"]

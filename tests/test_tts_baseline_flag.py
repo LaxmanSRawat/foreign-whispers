@@ -73,8 +73,9 @@ def test_sidecar_segments_contain_speed_factor(tmp_path):
 def test_fw_alignment_off_uses_unclamped_range(tmp_path, monkeypatch):
     """FW_ALIGNMENT=off bypasses the [0.85, 1.25] clamp (uses legacy [0.1, 10])."""
     monkeypatch.setenv("FW_ALIGNMENT", "off")
-    import importlib, tts
-    importlib.reload(tts)  # re-evaluate module-level FW_ALIGNMENT read
+    import importlib
+    import api.src.services.tts_engine as tts_engine
+    importlib.reload(tts_engine)  # re-evaluate module-level FW_ALIGNMENT read
 
     import numpy as np
     import soundfile as sf
@@ -91,7 +92,7 @@ def test_fw_alignment_off_uses_unclamped_range(tmp_path, monkeypatch):
             import shutil; shutil.copy(source_wav, file_path)
         engine.tts_to_file.side_effect = fake_tts
 
-        result = tts._synced_segment_audio(engine, "test", target_sec=1.0, work_dir=tmpdir)
+        result = tts_engine._synced_segment_audio(engine, "test", target_sec=1.0, work_dir=tmpdir)
         # With legacy clamp [0.1, 10]: speed=5.0 is allowed; result duration ≠ 1s target
         # With new clamp [0.85, 1.25]: speed would be clamped to 1.25; result ≈ 4s → trimmed to 1s
         # In legacy mode rubberband applies speed=5.0, result is 5/5=1s — so both modes trim.

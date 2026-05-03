@@ -4,11 +4,14 @@ ARG USERNAME=appuser
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
 
-# System packages
+# System packages + Rust (required by sudachipy via TTS -> spacy[ja])
 RUN apt-get update && \
-    apt-get install --no-install-recommends -y ffmpeg rubberband-cli imagemagick curl unzip fonts-dejavu-core && \
+    apt-get install --no-install-recommends -y build-essential ffmpeg rubberband-cli imagemagick curl unzip fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/* && \
     curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path && \
+    ln -s /root/.cargo/bin/cargo /usr/local/bin/cargo && \
+    ln -s /root/.cargo/bin/rustc /usr/local/bin/rustc && \
     sed -i 's/rights="none" pattern="@\*"/rights="read|write" pattern="@*"/' /etc/ImageMagick-6/policy.xml 2>/dev/null; \
     sed -i 's/rights="none" pattern="@\*"/rights="read|write" pattern="@*"/' /etc/ImageMagick-7/policy.xml 2>/dev/null; true
 

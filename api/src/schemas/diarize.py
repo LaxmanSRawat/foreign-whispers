@@ -1,5 +1,5 @@
 """Pydantic schemas for the diarize API contract."""
-
+# implemented in api/src/routers/diarize.py
 from pydantic import BaseModel
 
 

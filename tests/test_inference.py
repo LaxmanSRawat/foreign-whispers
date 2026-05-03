@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 import requests
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@ class TestLocalWhisperBackend:
         backend = LocalWhisperBackend(model_name="base")
         result = backend.transcribe("/tmp/audio.wav")
 
-        mock_load.assert_called_once_with("base")
+        mock_load.assert_called_once_with("base", device="cuda" if torch.cuda.is_available() else "cpu")
         fake_model.transcribe.assert_called_once_with("/tmp/audio.wav")
         assert result["text"] == "hello"
         assert len(result["segments"]) == 1
@@ -109,7 +110,7 @@ class TestLocalTTSBackend:
         result = backend.synthesize("hola mundo", "/tmp/out.wav")
 
         mock_tts_cls.assert_called_once_with(
-            model_name="tts_models/es/css10/vits", progress_bar=False
+            model_name="tts_models/es/css10/vits", progress_bar=False, gpu=torch.cuda.is_available()
         )
         fake_tts.tts_to_file.assert_called_once_with(
             text="hola mundo", file_path="/tmp/out.wav"
