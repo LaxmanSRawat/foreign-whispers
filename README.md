@@ -8,6 +8,11 @@ YouTube video dubbing pipeline — transcribe, translate, and dub 60 Minutes int
 
 ## Student Submission Notes
 
+### Team Information
+
+1. Laxman Singh Rawat (lr3531@nyu.edu)
+2. Harindham Sharma (hs6169@nyu.edu)
+
 ### Notebook Integration Work
 
 Each integration notebook introduced one stage of the pipeline. Below is a summary of the implementation approach taken per notebook and the reasoning behind it.
