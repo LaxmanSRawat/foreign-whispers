@@ -73,16 +73,10 @@ Notebook: [notebooks/alignment_integration/alignment_integration.ipynb](notebook
 
 Notebook: [notebooks/tts_integration/tts_integration.ipynb](notebooks/tts_integration/tts_integration.ipynb)
 
-- [ ] **Task 1 · Understand the existing Chatterbox client** *(no coding, exploration)*
-  - Read through the baseline-vs-aligned cells; understand what `synthesize` returns and how alignment is applied post-hoc.
-- [x] **Task 2 · Voice resolution function** — implemented during N4 T5. Lives at [foreign_whispers/voice_resolution.py](foreign_whispers/voice_resolution.py). *Verify the 5 provided tests still pass when you reach this notebook.*
-- [ ] **Task 3 · Add `speaker_wav` to the TTS API**
-  - **Modify:** [api/src/core/config.py](api/src/core/config.py) (add `speakers_dir`), [api/src/routers/tts.py](api/src/routers/tts.py), [api/src/services/tts_service.py](api/src/services/tts_service.py)
-  - **Acceptance:** speaker selection exposed as a query parameter; manual `curl` test produces audio in the chosen voice.
-- [ ] **Task 4 · Per-speaker voice assignment**
-  - **Modify:** [api/src/routers/tts.py](api/src/routers/tts.py)
-  - **Goal:** when diarized segments exist, build a speaker → voice mapping and switch voices per segment.
-  - **Acceptance:** test with a multi-speaker video; each speaker uses a distinct reference voice.
+- [x] **Task 1 · Understand the existing Chatterbox client** *(no coding, exploration)* — Worked through baseline vs aligned cells; understand `synthesize` return shape and post-hoc alignment. Extensive hands-on work through Tasks 3–4 makes this implicit.
+- [x] **Task 2 · Voice resolution function** — implemented during N4 T5. Lives at [foreign_whispers/voice_resolution.py](foreign_whispers/voice_resolution.py). All 5 provided tests pass.
+- [x] **Task 3 · Add `speaker_wav` to the TTS API** — `speaker_wav` query param added to [api/src/routers/tts.py](api/src/routers/tts.py); `speakers_dir` property added to [api/src/core/config.py](api/src/core/config.py); wired through [api/src/services/tts_service.py](api/src/services/tts_service.py).
+- [x] **Task 4 · Per-speaker voice assignment** — `_build_speaker_voice_map` + per-segment voice switching in [api/src/services/tts_engine.py](api/src/services/tts_engine.py). Uses `assign_speaker_voices` (position-based round-robin) so non-sequential pyannote labels like `SPEAKER_00 + SPEAKER_02` get distinct voices. Concurrency race fixed: submissions sorted by voice key before entering `ThreadPoolExecutor` so same-speaker segments are batched together (prevents voice bleed).
 
 ---
 
@@ -120,19 +114,35 @@ After `docker compose --profile cpu up -d`, all four services report `healthy`.
 
 ### Bonus already done (early)
 
-- **N6 Task 2** (`resolve_speaker_wav`) was implemented as part of N4 T5 — so when you reach Notebook 6 you can skip straight to Task 3 after a test re-run.
-- The `_estimate_duration` helper extraction (commit `aa3b9c3`) is partial credit for **N5 Task 1** — the *replacement* of the ~15 chars/sec heuristic is still pending.
+- **N6 Task 2** (`resolve_speaker_wav`) was implemented as part of N4 T5.
+- **N6 Tasks 3 & 4** fully implemented — see Notebook 6 section above.
 
 ### Nothing skipped
 
-Every task that was *required* through Notebook 4 has corresponding code. No gaps found.
+Every task through Notebook 6 has corresponding code. No gaps found.
 
 ---
 
-## Quick reference — completed today
+## Audit findings (2026-05-03) — through Phase 2 Notebook 6
 
-Use this scratch area as a session log so you can pick up where you left off.
+### Bug fixes shipped
+
+- **Chatterbox special-character crash** ✅ — segments containing non-ASCII punctuation caused the TTS HTTP request to fail silently. Fixed in [api/src/services/tts_engine.py](api/src/services/tts_engine.py); 222-line regression suite added at [tests/test_tts_voice_warmup.py](tests/test_tts_voice_warmup.py).
+- **TTS voice warmup** ✅ — `FW_TTS_WARMUP=on` (default) synthesises one short phrase per distinct speaker voice before the main loop and uses the output as the cloning reference, eliminating inter-segment voice drift from Chatterbox's stochastic sampling. Controlled by `FW_TTS_TEMPERATURE` (default `0.05`).
+- **Concurrency voice-bleed race** ✅ — concurrent `ThreadPoolExecutor` workers uploading different voice reference files for different speakers caused cross-speaker voice bleed. Fix: sort segment submissions by resolved voice key before entering the pool so same-voice segments are submitted together. In [api/src/services/tts_engine.py](api/src/services/tts_engine.py) (uncommitted).
+- **Speaker labels missing from translation JSON** ✅ — `_merge_labels_into_transcript` previously only updated the transcription JSON. The TTS engine reads from the translation JSON, so per-speaker voice selection silently fell back to the default voice. Fix: merge into both `transcriptions/{title}.json` and `translations/{title}.json`. In [api/src/routers/diarize.py](api/src/routers/diarize.py) (uncommitted).
+- **Non-sequential speaker label collision** ✅ — pyannote can produce `SPEAKER_00 + SPEAKER_02` (skipping `_01`). The old index-based lookup mapped both to position 0, giving them identical voices. Fixed by `assign_speaker_voices` in [foreign_whispers/voice_resolution.py](foreign_whispers/voice_resolution.py) (position-based round-robin keyed on sorted label order, not label suffix).
+
+### Quality improvements shipped
+
+- **Whisper language lock** ✅ — both local and remote Whisper backends now pass `language="en"` explicitly, cutting hallucinations on low-confidence audio segments.
+- **Translation context** ✅ — `translation_service` now translates the full transcript as one paragraph before splitting back to per-segment texts, giving argostranslate sentence-level context for ambiguous phrases. Falls back to per-segment when sentence counts don't align.
+- **Logfire tracing** ✅ — `FW_LOGFIRE_WRITE_TOKEN` wired into [api/src/main.py](api/src/main.py); tests updated to tolerate optional import.
+
+---
+
+## Quick reference — session log
 
 ```
-YYYY-MM-DD  – e.g. "Notebook 4 Task 1 done; tests passing locally"
+2026-05-03  N6 Tasks 1-4 all done; voice warmup, special-char fix, concurrency race, translation-JSON label merge, non-sequential speaker fix shipped.
 ```

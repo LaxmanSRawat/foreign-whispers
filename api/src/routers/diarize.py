@@ -17,18 +17,26 @@ _alignment_service = AlignmentService(settings=settings)
 
 
 def _merge_labels_into_transcript(title: str, diar_segments: list[dict]) -> None:
-    """Idempotently merge speaker labels into the cached transcription JSON.
+    """Idempotently merge speaker labels into the cached transcription and translation JSONs.
 
     Runs whether the diarization is fresh or cached so that re-transcribing
     a video (or hitting the diarize cache after a code change that adds the
     merge) still produces a labelled transcript on disk.
+
+    Both the transcription and translation JSONs share the same segment
+    timestamps, so ``assign_speakers`` (overlap-based matching) works for both.
+    The TTS engine reads from the translation JSON, so labels must be present
+    there for per-speaker voice selection to work.
     """
-    transcript_path = settings.transcriptions_dir / f"{title}.json"
-    if not transcript_path.exists():
-        return
-    transcript = json.loads(transcript_path.read_text())
-    transcript["segments"] = assign_speakers(transcript.get("segments", []), diar_segments)
-    transcript_path.write_text(json.dumps(transcript))
+    for json_path in [
+        settings.transcriptions_dir / f"{title}.json",
+        settings.translations_dir / f"{title}.json",
+    ]:
+        if not json_path.exists():
+            continue
+        data = json.loads(json_path.read_text())
+        data["segments"] = assign_speakers(data.get("segments", []), diar_segments)
+        json_path.write_text(json.dumps(data))
 
 
 @router.post("/diarize/{video_id}", response_model=DiarizeResponse)

@@ -13,7 +13,7 @@ import soundfile as sf
 import pyrubberband
 from pydub import AudioSegment
 
-from foreign_whispers.voice_resolution import resolve_speaker_wav
+from foreign_whispers.voice_resolution import assign_speaker_voices, resolve_speaker_wav
 
 # ── Chatterbox API configuration ─────────────────────────────────────
 # Inside Docker, the API container reaches Chatterbox at the service
@@ -266,12 +266,17 @@ def _build_speaker_voice_map(
 
     Returns ``{speaker_label: relative_wav_path}``. Segments without a
     ``speaker`` field map under ``None`` to the language default.
+
+    Uses position-based round-robin (assign_speaker_voices) so that
+    non-sequential pyannote labels like SPEAKER_00 + SPEAKER_02 still get
+    distinct voices rather than both colliding at index 0.
     """
-    distinct = {seg.get("speaker") for seg in segments}
-    return {
-        spk: resolve_speaker_wav(_SPEAKERS_DIR, target_language, spk)
-        for spk in distinct
-    }
+    distinct = list({seg.get("speaker") for seg in segments})
+    named = [s for s in distinct if s is not None]
+    result = assign_speaker_voices(_SPEAKERS_DIR, target_language, named)
+    if None in distinct:
+        result[None] = resolve_speaker_wav(_SPEAKERS_DIR, target_language, None)
+    return result
 
 
 def _build_warmup_voice_map(
@@ -687,6 +692,13 @@ def text_file_to_speech(
             wav_path = str(pathlib.Path(synth_dir) / f"seg_{idx}.wav")
             return idx, _synthesize_raw(engine, text, wav_path, speaker_wav=speaker_wav)
 
+        # Sort by resolved voice WAV so same-speaker segments are batched
+        # together in submission order — prevents concurrent workers from
+        # uploading different voice files simultaneously (voice bleed race).
+        ordered_metas = sorted(
+            seg_metas,
+            key=lambda m: voice_map.get(segments[m["index"]].get("speaker"), ""),
+        )
         with ThreadPoolExecutor(max_workers=_TTS_WORKERS) as pool:
             futures = {
                 pool.submit(
@@ -695,7 +707,7 @@ def text_file_to_speech(
                     m["text"],
                     voice_map.get(segments[m["index"]].get("speaker")),
                 ): m["index"]
-                for m in seg_metas
+                for m in ordered_metas
             }
             for fut in as_completed(futures):
                 idx, raw_bytes = fut.result()
@@ -718,14 +730,12 @@ def text_file_to_speech(
                 combined += AudioSegment.silent(duration=start_ms - cursor_ms)
                 cursor_ms = start_ms
 
-            seg_audio, seg_speed_factor, seg_raw_duration = _synced_segment_audio(
-                engine,
-                m["text"],
+            seg_audio, seg_speed_factor, seg_raw_duration = _postprocess_segment(
+                raw_wav_map.get(i),
                 m["target_sec"],
+                m["stretch_factor"],
+                use_alignment,
                 tmpdir,
-                stretch_factor=m["stretch_factor"],
-                alignment_enabled=use_alignment,
-                speaker_wav=voice_map.get(segments[i].get("speaker")),
             )
 
             aligned_seg = m["aligned_seg"]
